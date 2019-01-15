@@ -12,32 +12,22 @@
 // limitations under the License.
 
 //! tests for wallet restore
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_keychain as keychain;
-extern crate grin_store as store;
-extern crate grin_util as util;
-extern crate grin_wallet as wallet;
-extern crate rand;
 #[macro_use]
 extern crate log;
-extern crate chrono;
-extern crate serde;
-extern crate uuid;
-
-mod common;
-use common::testclient::{LocalWalletClient, WalletProxy};
-
+use self::core::global;
+use self::core::global::ChainTypes;
+use self::core::libtx::slate::Slate;
+use self::keychain::{ExtKeychain, Identifier, Keychain};
+use self::wallet::libwallet;
+use self::wallet::libwallet::types::AcctPathMapping;
+use self::wallet::test_framework::{self, LocalWalletClient, WalletProxy};
+use grin_core as core;
+use grin_keychain as keychain;
+use grin_util as util;
+use grin_wallet as wallet;
 use std::fs;
 use std::thread;
 use std::time::Duration;
-
-use core::global;
-use core::global::ChainTypes;
-use keychain::{ExtKeychain, Identifier, Keychain};
-use wallet::libtx::slate::Slate;
-use wallet::libwallet;
-use wallet::libwallet::types::AcctPathMapping;
 
 fn clean_output_dir(test_dir: &str) {
 	let _ = fs::remove_dir_all(test_dir);
@@ -59,7 +49,7 @@ fn restore_wallet(base_dir: &str, wallet_dir: &str) -> Result<(), libwallet::Err
 	let mut wallet_proxy: WalletProxy<LocalWalletClient, ExtKeychain> = WalletProxy::new(base_dir);
 	let client = LocalWalletClient::new(wallet_dir, wallet_proxy.tx.clone());
 
-	let wallet = common::create_wallet(&dest_dir, client.clone());
+	let wallet = test_framework::create_wallet(&dest_dir, client.clone(), None);
 
 	wallet_proxy.add_wallet(wallet_dir, client.get_send_instance(), wallet.clone());
 
@@ -73,7 +63,7 @@ fn restore_wallet(base_dir: &str, wallet_dir: &str) -> Result<(), libwallet::Err
 	// perform the restore and update wallet info
 	wallet::controller::owner_single_use(wallet.clone(), |api| {
 		let _ = api.restore()?;
-		let _ = api.retrieve_summary_info(true)?;
+		let _ = api.retrieve_summary_info(true, 1)?;
 		Ok(())
 	})?;
 
@@ -92,7 +82,7 @@ fn compare_wallet_restore(
 	let mut wallet_proxy: WalletProxy<LocalWalletClient, ExtKeychain> = WalletProxy::new(base_dir);
 
 	let client = LocalWalletClient::new(wallet_dir, wallet_proxy.tx.clone());
-	let wallet_source = common::create_wallet(&source_dir, client.clone());
+	let wallet_source = test_framework::create_wallet(&source_dir, client.clone(), None);
 	wallet_proxy.add_wallet(
 		&wallet_dir,
 		client.get_send_instance(),
@@ -100,7 +90,7 @@ fn compare_wallet_restore(
 	);
 
 	let client = LocalWalletClient::new(&restore_name, wallet_proxy.tx.clone());
-	let wallet_dest = common::create_wallet(&dest_dir, client.clone());
+	let wallet_dest = test_framework::create_wallet(&dest_dir, client.clone(), None);
 	wallet_proxy.add_wallet(
 		&restore_name,
 		client.get_send_instance(),
@@ -135,15 +125,15 @@ fn compare_wallet_restore(
 
 	// Overall wallet info should be the same
 	wallet::controller::owner_single_use(wallet_source.clone(), |api| {
-		src_info = Some(api.retrieve_summary_info(true)?.1);
-		src_txs = Some(api.retrieve_txs(true, None)?.1);
+		src_info = Some(api.retrieve_summary_info(true, 1)?.1);
+		src_txs = Some(api.retrieve_txs(true, None, None)?.1);
 		src_accts = Some(api.accounts()?);
 		Ok(())
 	})?;
 
 	wallet::controller::owner_single_use(wallet_dest.clone(), |api| {
-		dest_info = Some(api.retrieve_summary_info(true)?.1);
-		dest_txs = Some(api.retrieve_txs(true, None)?.1);
+		dest_info = Some(api.retrieve_summary_info(true, 1)?.1);
+		dest_txs = Some(api.retrieve_txs(true, None, None)?.1);
 		dest_accts = Some(api.accounts()?);
 		Ok(())
 	})?;
@@ -187,19 +177,21 @@ fn setup_restore(test_dir: &str) -> Result<(), libwallet::Error> {
 
 	// Create a new wallet test client, and set its queues to communicate with the
 	// proxy
-	let client = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
-	let wallet1 = common::create_wallet(&format!("{}/wallet1", test_dir), client.clone());
-	wallet_proxy.add_wallet("wallet1", client.get_send_instance(), wallet1.clone());
+	let client1 = LocalWalletClient::new("wallet1", wallet_proxy.tx.clone());
+	let wallet1 =
+		test_framework::create_wallet(&format!("{}/wallet1", test_dir), client1.clone(), None);
+	wallet_proxy.add_wallet("wallet1", client1.get_send_instance(), wallet1.clone());
 
 	// define recipient wallet, add to proxy
-	let client = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
-	let wallet2 = common::create_wallet(&format!("{}/wallet2", test_dir), client.clone());
-	wallet_proxy.add_wallet("wallet2", client.get_send_instance(), wallet2.clone());
+	let client2 = LocalWalletClient::new("wallet2", wallet_proxy.tx.clone());
+	let wallet2 =
+		test_framework::create_wallet(&format!("{}/wallet2", test_dir), client2.clone(), None);
+	wallet_proxy.add_wallet("wallet2", client2.get_send_instance(), wallet2.clone());
 
 	// wallet 2 will use another account
 	wallet::controller::owner_single_use(wallet2.clone(), |api| {
-		api.new_account_path("account1")?;
-		api.new_account_path("account2")?;
+		api.create_account_path("account1")?;
+		api.create_account_path("account2")?;
 		Ok(())
 	})?;
 
@@ -210,9 +202,10 @@ fn setup_restore(test_dir: &str) -> Result<(), libwallet::Error> {
 	}
 
 	// Another wallet
-	let client = LocalWalletClient::new("wallet3", wallet_proxy.tx.clone());
-	let wallet3 = common::create_wallet(&format!("{}/wallet3", test_dir), client.clone());
-	wallet_proxy.add_wallet("wallet3", client.get_send_instance(), wallet3.clone());
+	let client3 = LocalWalletClient::new("wallet3", wallet_proxy.tx.clone());
+	let wallet3 =
+		test_framework::create_wallet(&format!("{}/wallet3", test_dir), client3.clone(), None);
+	wallet_proxy.add_wallet("wallet3", client3.get_send_instance(), wallet3.clone());
 
 	// Set the wallet proxy listener running
 	thread::spawn(move || {
@@ -222,7 +215,7 @@ fn setup_restore(test_dir: &str) -> Result<(), libwallet::Error> {
 	});
 
 	// mine a few blocks
-	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 10);
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), 10);
 
 	// assert wallet contents
 	// and a single use api for a send command
@@ -230,51 +223,62 @@ fn setup_restore(test_dir: &str) -> Result<(), libwallet::Error> {
 	let mut slate = Slate::blank(1);
 	wallet::controller::owner_single_use(wallet1.clone(), |sender_api| {
 		// note this will increment the block count as part of the transaction "Posting"
-		slate = sender_api.issue_send_tx(
-			amount,    // amount
-			2,         // minimum confirmations
-			"wallet2", // dest
-			500,       // max outputs
-			1,         // num change outputs
-			true,      // select all outputs
+		let (slate_i, lock_fn) = sender_api.initiate_tx(
+			None, amount, // amount
+			2,      // minimum confirmations
+			500,    // max outputs
+			1,      // num change outputs
+			true,   // select all outputs
+			None,
 		)?;
-		sender_api.post_tx(&slate, false)?;
+		slate = client1.send_tx_slate_direct("wallet2", &slate_i)?;
+		sender_api.tx_lock_outputs(&slate, lock_fn)?;
+		sender_api.finalize_tx(&mut slate)?;
+		sender_api.post_tx(&slate.tx, false)?;
 		Ok(())
 	})?;
 
 	// mine a few more blocks
-	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 3);
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), 3);
 
 	// Send some to wallet 3
 	wallet::controller::owner_single_use(wallet1.clone(), |sender_api| {
 		// note this will increment the block count as part of the transaction "Posting"
-		slate = sender_api.issue_send_tx(
+		let (slate_i, lock_fn) = sender_api.initiate_tx(
+			None,
 			amount * 2, // amount
 			2,          // minimum confirmations
-			"wallet3",  // dest
 			500,        // max outputs
 			1,          // num change outputs
 			true,       // select all outputs
+			None,
 		)?;
-		sender_api.post_tx(&slate, false)?;
+		slate = client1.send_tx_slate_direct("wallet3", &slate_i)?;
+		sender_api.tx_lock_outputs(&slate, lock_fn)?;
+		sender_api.finalize_tx(&mut slate)?;
+		sender_api.post_tx(&slate.tx, false)?;
 		Ok(())
 	})?;
 
 	// mine a few more blocks
-	let _ = common::award_blocks_to_wallet(&chain, wallet3.clone(), 10);
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet3.clone(), 10);
 
 	// Wallet3 to wallet 2
 	wallet::controller::owner_single_use(wallet3.clone(), |sender_api| {
 		// note this will increment the block count as part of the transaction "Posting"
-		slate = sender_api.issue_send_tx(
+		let (slate_i, lock_fn) = sender_api.initiate_tx(
+			None,
 			amount * 3, // amount
 			2,          // minimum confirmations
-			"wallet2",  // dest
 			500,        // max outputs
 			1,          // num change outputs
 			true,       // select all outputs
+			None,
 		)?;
-		sender_api.post_tx(&slate, false)?;
+		slate = client3.send_tx_slate_direct("wallet2", &slate_i)?;
+		sender_api.tx_lock_outputs(&slate, lock_fn)?;
+		sender_api.finalize_tx(&mut slate)?;
+		sender_api.post_tx(&slate.tx, false)?;
 		Ok(())
 	})?;
 
@@ -285,37 +289,41 @@ fn setup_restore(test_dir: &str) -> Result<(), libwallet::Error> {
 	}
 
 	// mine a few more blocks
-	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 2);
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), 2);
 
 	// Wallet3 to wallet 2 again (to another account)
 	wallet::controller::owner_single_use(wallet3.clone(), |sender_api| {
 		// note this will increment the block count as part of the transaction "Posting"
-		slate = sender_api.issue_send_tx(
+		let (slate_i, lock_fn) = sender_api.initiate_tx(
+			None,
 			amount * 3, // amount
 			2,          // minimum confirmations
-			"wallet2",  // dest
 			500,        // max outputs
 			1,          // num change outputs
 			true,       // select all outputs
+			None,
 		)?;
-		sender_api.post_tx(&slate, false)?;
+		slate = client3.send_tx_slate_direct("wallet2", &slate_i)?;
+		sender_api.tx_lock_outputs(&slate, lock_fn)?;
+		sender_api.finalize_tx(&mut slate)?;
+		sender_api.post_tx(&slate.tx, false)?;
 		Ok(())
 	})?;
 
 	// mine a few more blocks
-	let _ = common::award_blocks_to_wallet(&chain, wallet1.clone(), 5);
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), 5);
 
 	// update everyone
 	wallet::controller::owner_single_use(wallet1.clone(), |api| {
-		let _ = api.retrieve_summary_info(true)?;
+		let _ = api.retrieve_summary_info(true, 1)?;
 		Ok(())
 	})?;
 	wallet::controller::owner_single_use(wallet2.clone(), |api| {
-		let _ = api.retrieve_summary_info(true)?;
+		let _ = api.retrieve_summary_info(true, 1)?;
 		Ok(())
 	})?;
 	wallet::controller::owner_single_use(wallet3.clone(), |api| {
-		let _ = api.retrieve_summary_info(true)?;
+		let _ = api.retrieve_summary_info(true, 1)?;
 		Ok(())
 	})?;
 

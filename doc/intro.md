@@ -1,6 +1,6 @@
 # Introduction to MimbleWimble and Grin
 
-*Read this in other languages: [English](intro.md), [简体中文](intro.zh-cn.md), [Español](intro_ES.md), [Русский](intro.ru.md).*
+*Read this in other languages: [English](intro.md), [简体中文](intro.zh-cn.md), [Español](intro_ES.md), [Русский](intro.ru.md), [日本語　](intro.jp.md).*
 
 MimbleWimble is a blockchain format and protocol that provides
 extremely good scalability, privacy and fungibility by relying on strong
@@ -16,13 +16,12 @@ The main goal and characteristics of the Grin project are:
 * Privacy by default. This enables complete fungibility without precluding
   the ability to selectively disclose information as needed.
 * Scales mostly with the number of users and minimally with the number of
-  transactions (<100 byte `kernel), resulting in a large space saving compared
+  transactions (<100 byte `kernel`), resulting in a large space saving compared
   to other blockchains.
 * Strong and proven cryptography. MimbleWimble only relies on Elliptic Curve
   Cryptography which has been tried and tested for decades.
 * Design simplicity that makes it easy to audit and maintain over time.
-* Community driven, using an asic-resistant mining algorithm (Cuckoo Cycle)
-  encouraging mining decentralization.
+* Community driven, encouraging mining decentralization.
 
 ## Tongue Tying for Everyone
 
@@ -143,7 +142,7 @@ This is the first pillar of MimbleWimble: the arithmetic required to validate a
 transaction can be done without knowing any of the values.
 
 As a final note, this idea is actually derived from Greg Maxwell's
-[Confidential Transactions](https://www.elementsproject.org/elements/confidential-transactions/),
+[Confidential Transactions](https://elementsproject.org/features/confidential-transactions/investigation),
 which is itself derived from an Adam Back proposal for homomorphic values applied
 to Bitcoin.
 

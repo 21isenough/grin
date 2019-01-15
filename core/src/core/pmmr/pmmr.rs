@@ -17,11 +17,12 @@ use std::u64;
 
 use croaring::Bitmap;
 
-use core::hash::Hash;
-use core::merkle_proof::MerkleProof;
-use core::pmmr::{Backend, ReadonlyPMMR};
-use core::BlockHeader;
-use ser::{PMMRIndexHashable, PMMRable};
+use crate::core::hash::{Hash, ZERO_HASH};
+use crate::core::merkle_proof::MerkleProof;
+use crate::core::pmmr::{Backend, ReadonlyPMMR};
+use crate::core::BlockHeader;
+use crate::ser::{PMMRIndexHashable, PMMRable};
+use std::path::Path;
 
 /// 64 bits all ones: 0b11111111...1
 const ALL_ONES: u64 = u64::MAX;
@@ -36,7 +37,7 @@ const ALL_ONES: u64 = u64::MAX;
 pub struct PMMR<'a, T, B>
 where
 	T: PMMRable,
-	B: 'a + Backend<T>,
+	B: Backend<T>,
 {
 	/// The last position in the PMMR
 	pub last_pos: u64,
@@ -47,11 +48,11 @@ where
 
 impl<'a, T, B> PMMR<'a, T, B>
 where
-	T: PMMRable + ::std::fmt::Debug,
+	T: PMMRable,
 	B: 'a + Backend<T>,
 {
 	/// Build a new prunable Merkle Mountain Range using the provided backend.
-	pub fn new(backend: &'a mut B) -> PMMR<T, B> {
+	pub fn new(backend: &'a mut B) -> PMMR<'_, T, B> {
 		PMMR {
 			backend,
 			last_pos: 0,
@@ -61,7 +62,7 @@ where
 
 	/// Build a new prunable Merkle Mountain Range pre-initialized until
 	/// last_pos with the provided backend.
-	pub fn at(backend: &'a mut B, last_pos: u64) -> PMMR<T, B> {
+	pub fn at(backend: &'a mut B, last_pos: u64) -> PMMR<'_, T, B> {
 		PMMR {
 			backend,
 			last_pos,
@@ -70,7 +71,7 @@ where
 	}
 
 	/// Build a "readonly" view of this PMMR.
-	pub fn readonly_pmmr(&self) -> ReadonlyPMMR<T, B> {
+	pub fn readonly_pmmr(&self) -> ReadonlyPMMR<'_, T, B> {
 		ReadonlyPMMR::at(&self.backend, self.last_pos)
 	}
 
@@ -83,7 +84,8 @@ where
 				// here we want to get from underlying hash file
 				// as the pos *may* have been "removed"
 				self.backend.get_from_file(pi)
-			}).collect()
+			})
+			.collect()
 	}
 
 	fn peak_path(&self, peak_pos: u64) -> Vec<Hash> {
@@ -124,6 +126,9 @@ where
 	/// Computes the root of the MMR. Find all the peaks in the current
 	/// tree and "bags" them to get a single peak.
 	pub fn root(&self) -> Hash {
+		if self.is_empty() {
+			return ZERO_HASH;
+		}
 		let mut res = None;
 		for peak in self.peaks().iter().rev() {
 			res = match res {
@@ -168,11 +173,11 @@ where
 
 	/// Push a new element into the MMR. Computes new related peaks at
 	/// the same time if applicable.
-	pub fn push(&mut self, elmt: T) -> Result<u64, String> {
+	pub fn push(&mut self, elmt: &T) -> Result<u64, String> {
 		let elmt_pos = self.last_pos + 1;
 		let mut current_hash = elmt.hash_with_index(elmt_pos - 1);
 
-		let mut to_append = vec![current_hash];
+		let mut hashes = vec![current_hash];
 		let mut pos = elmt_pos;
 
 		let (peak_map, height) = peak_map_height(pos - 1);
@@ -190,11 +195,11 @@ where
 			peak *= 2;
 			pos += 1;
 			current_hash = (left_hash, current_hash).hash_with_index(pos - 1);
-			to_append.push(current_hash);
+			hashes.push(current_hash);
 		}
 
 		// append all the new nodes and update the MMR index
-		self.backend.append(elmt, to_append)?;
+		self.backend.append(elmt, hashes)?;
 		self.last_pos = pos;
 		Ok(elmt_pos)
 	}
@@ -256,7 +261,7 @@ where
 	}
 
 	/// Get the data element at provided position in the MMR.
-	pub fn get_data(&self, pos: u64) -> Option<T> {
+	pub fn get_data(&self, pos: u64) -> Option<T::E> {
 		if pos > self.last_pos {
 			// If we are beyond the rhs of the MMR return None.
 			None
@@ -277,49 +282,6 @@ where
 		} else {
 			self.backend.get_from_file(pos)
 		}
-	}
-
-	/// Helper function to get the last N nodes inserted, i.e. the last
-	/// n nodes along the bottom of the tree.
-	/// May return less than n items if the MMR has been pruned/compacted.
-	pub fn get_last_n_insertions(&self, n: u64) -> Vec<(Hash, T)> {
-		let mut return_vec = vec![];
-		let mut last_leaf = self.last_pos;
-		for _ in 0..n as u64 {
-			if last_leaf == 0 {
-				break;
-			}
-			last_leaf = bintree_rightmost(last_leaf);
-
-			if let Some(hash) = self.backend.get_hash(last_leaf) {
-				if let Some(data) = self.backend.get_data(last_leaf) {
-					return_vec.push((hash, data));
-				}
-			}
-			last_leaf -= 1;
-		}
-		return_vec
-	}
-
-	/// Helper function which returns un-pruned nodes from the insertion index
-	/// forward
-	/// returns last insertion index returned along with data
-	pub fn elements_from_insertion_index(&self, mut index: u64, max_count: u64) -> (u64, Vec<T>) {
-		let mut return_vec = vec![];
-		if index == 0 {
-			index = 1;
-		}
-		let mut return_index = index;
-		let mut pmmr_index = insertion_to_pmmr_index(index);
-		while return_vec.len() < max_count as usize && pmmr_index <= self.last_pos {
-			if let Some(t) = self.get_data(pmmr_index) {
-				return_vec.push(t);
-				return_index = index;
-			}
-			index += 1;
-			pmmr_index = insertion_to_pmmr_index(index);
-		}
-		(return_index, return_vec)
 	}
 
 	/// Walks all unpruned nodes in the MMR and revalidate all parent hashes
@@ -350,6 +312,11 @@ where
 		Ok(())
 	}
 
+	/// Is the MMR empty?
+	pub fn is_empty(&self) -> bool {
+		self.last_pos == 0
+	}
+
 	/// Total size of the tree, including intermediary nodes and ignoring any
 	/// pruning.
 	pub fn unpruned_size(&self) -> u64 {
@@ -357,7 +324,7 @@ where
 	}
 
 	/// Return the path of the data file (needed to sum kernels efficiently)
-	pub fn data_file_path(&self) -> String {
+	pub fn data_file_path(&self) -> &Path {
 		self.backend.get_data_file_path()
 	}
 

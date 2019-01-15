@@ -23,9 +23,8 @@
 #![warn(missing_docs)]
 
 pub mod api;
-pub mod controller;
 mod error;
 pub mod internal;
 pub mod types;
 
-pub use libwallet::error::{Error, ErrorKind};
+pub use crate::libwallet::error::{Error, ErrorKind};

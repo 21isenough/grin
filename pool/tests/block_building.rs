@@ -12,35 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate blake2_rfc as blake2;
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_keychain as keychain;
-extern crate grin_pool as pool;
-extern crate grin_util as util;
-extern crate grin_wallet as wallet;
-
-extern crate chrono;
-extern crate rand;
-
 pub mod common;
 
+use self::core::core::hash::Hashed;
+use self::core::core::verifier_cache::LruVerifierCache;
+use self::core::core::{Block, BlockHeader, Transaction};
+use self::core::libtx;
+use self::core::pow::Difficulty;
+use self::keychain::{ExtKeychain, Keychain};
+use self::util::RwLock;
+use crate::common::*;
+use grin_core as core;
+use grin_keychain as keychain;
+use grin_util as util;
 use std::sync::Arc;
-use util::RwLock;
-
-use core::core::verifier_cache::LruVerifierCache;
-use core::core::{Block, BlockHeader, Transaction};
-use core::pow::Difficulty;
-
-use keychain::{ExtKeychain, Keychain};
-use wallet::libtx;
-
-use common::*;
 
 #[test]
 fn test_transaction_pool_block_building() {
 	util::init_test_logger();
-	let keychain: ExtKeychain = Keychain::from_random_seed().unwrap();
+	let keychain: ExtKeychain = Keychain::from_random_seed(false).unwrap();
 
 	let db_root = ".grin_block_building".to_string();
 	clean_output_dir(db_root.clone());
@@ -54,21 +44,26 @@ fn test_transaction_pool_block_building() {
 		let height = prev_header.height + 1;
 		let key_id = ExtKeychain::derive_key_id(1, height as u32, 0, 0, 0);
 		let fee = txs.iter().map(|x| x.fee()).sum();
-		let reward = libtx::reward::output(&keychain, &key_id, fee, height).unwrap();
-		let block = Block::new(&prev_header, txs, Difficulty::min(), reward).unwrap();
+		let reward = libtx::reward::output(&keychain, &key_id, fee).unwrap();
+		let mut block = Block::new(&prev_header, txs, Difficulty::min(), reward).unwrap();
+
+		// Set the prev_root to the prev hash for testing purposes (no MMR to obtain a root from).
+		block.header.prev_root = prev_header.hash();
 
 		chain.update_db_for_block(&block);
-		block.header
+		block
 	};
 
-	let header = add_block(BlockHeader::default(), vec![], &mut chain);
+	let block = add_block(BlockHeader::default(), vec![], &mut chain);
+	let header = block.header;
 
 	// Now create tx to spend that first coinbase (now matured).
 	// Provides us with some useful outputs to test with.
 	let initial_tx = test_transaction_spending_coinbase(&keychain, &header, vec![10, 20, 30, 40]);
 
 	// Mine that initial tx so we can spend it with multiple txs
-	let header = add_block(header, vec![initial_tx], &mut chain);
+	let block = add_block(header, vec![initial_tx], &mut chain);
+	let header = block.header;
 
 	// Initialize a new pool with our chain adapter.
 	let pool = RwLock::new(test_setup(Arc::new(chain.clone()), verifier_cache));
@@ -112,14 +107,7 @@ fn test_transaction_pool_block_building() {
 	// children should have been aggregated into parents
 	assert_eq!(txs.len(), 3);
 
-	let block = {
-		let key_id = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
-		let fees = txs.iter().map(|tx| tx.fee()).sum();
-		let reward = libtx::reward::output(&keychain, &key_id, fees, 0).unwrap();
-		Block::new(&header, txs, Difficulty::min(), reward)
-	}.unwrap();
-
-	chain.update_db_for_block(&block);
+	let block = add_block(header, txs, &mut chain);
 
 	// Now reconcile the transaction pool with the new block
 	// and check the resulting contents of the pool are what we expect.

@@ -12,33 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate blake2_rfc as blake2;
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_keychain as keychain;
-extern crate grin_pool as pool;
-extern crate grin_util as util;
-extern crate grin_wallet as wallet;
-
-extern crate chrono;
-extern crate rand;
-
 pub mod common;
 
+use self::core::core::hash::Hashed;
+use self::core::core::verifier_cache::LruVerifierCache;
+use self::core::core::{Block, BlockHeader};
+use self::core::libtx;
+use self::core::pow::Difficulty;
+use self::keychain::{ExtKeychain, Keychain};
+use self::util::RwLock;
+use crate::common::ChainAdapter;
+use crate::common::*;
+use grin_core as core;
+use grin_keychain as keychain;
+use grin_util as util;
 use std::sync::Arc;
-use util::RwLock;
-
-use core::core::{Block, BlockHeader};
-
-use common::*;
-use core::core::verifier_cache::LruVerifierCache;
-use core::pow::Difficulty;
-use keychain::{ExtKeychain, Keychain};
-use wallet::libtx;
 
 #[test]
 fn test_transaction_pool_block_reconciliation() {
-	let keychain: ExtKeychain = Keychain::from_random_seed().unwrap();
+	let keychain: ExtKeychain = Keychain::from_random_seed(false).unwrap();
 
 	let db_root = ".grin_block_reconciliation".to_string();
 	clean_output_dir(db_root.clone());
@@ -52,8 +44,12 @@ fn test_transaction_pool_block_reconciliation() {
 	let header = {
 		let height = 1;
 		let key_id = ExtKeychain::derive_key_id(1, height as u32, 0, 0, 0);
-		let reward = libtx::reward::output(&keychain, &key_id, 0, height).unwrap();
-		let block = Block::new(&BlockHeader::default(), vec![], Difficulty::min(), reward).unwrap();
+		let reward = libtx::reward::output(&keychain, &key_id, 0).unwrap();
+		let genesis = BlockHeader::default();
+		let mut block = Block::new(&genesis, vec![], Difficulty::min(), reward).unwrap();
+
+		// Set the prev_root to the prev hash for testing purposes (no MMR to obtain a root from).
+		block.header.prev_root = genesis.hash();
 
 		chain.update_db_for_block(&block);
 
@@ -67,8 +63,11 @@ fn test_transaction_pool_block_reconciliation() {
 	let block = {
 		let key_id = ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
 		let fees = initial_tx.fee();
-		let reward = libtx::reward::output(&keychain, &key_id, fees, 0).unwrap();
-		let block = Block::new(&header, vec![initial_tx], Difficulty::min(), reward).unwrap();
+		let reward = libtx::reward::output(&keychain, &key_id, fees).unwrap();
+		let mut block = Block::new(&header, vec![initial_tx], Difficulty::min(), reward).unwrap();
+
+		// Set the prev_root to the prev hash for testing purposes (no MMR to obtain a root from).
+		block.header.prev_root = header.hash();
 
 		chain.update_db_for_block(&block);
 
@@ -157,8 +156,11 @@ fn test_transaction_pool_block_reconciliation() {
 	let block = {
 		let key_id = ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 		let fees = block_txs.iter().map(|tx| tx.fee()).sum();
-		let reward = libtx::reward::output(&keychain, &key_id, fees, 0).unwrap();
-		let block = Block::new(&header, block_txs, Difficulty::min(), reward).unwrap();
+		let reward = libtx::reward::output(&keychain, &key_id, fees).unwrap();
+		let mut block = Block::new(&header, block_txs, Difficulty::min(), reward).unwrap();
+
+		// Set the prev_root to the prev hash for testing purposes (no MMR to obtain a root from).
+		block.header.prev_root = header.hash();
 
 		chain.update_db_for_block(&block);
 		block

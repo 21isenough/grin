@@ -15,41 +15,36 @@
 //! Types and traits that should be provided by a wallet
 //! implementation
 
+use crate::core::core::hash::Hash;
+use crate::core::core::Transaction;
+use crate::core::libtx::aggsig;
+use crate::core::ser;
+use crate::keychain::{Identifier, Keychain};
+use crate::libwallet::error::{Error, ErrorKind};
+use crate::util::secp::key::{PublicKey, SecretKey};
+use crate::util::secp::{self, pedersen, Secp256k1};
 use chrono::prelude::*;
-use std::collections::HashMap;
-use std::fmt;
-
+use failure::ResultExt;
 use serde;
 use serde_json;
-
-use failure::ResultExt;
+use std::collections::HashMap;
+use std::fmt;
 use uuid::Uuid;
-
-use core::core::hash::Hash;
-use core::ser;
-
-use keychain::{Identifier, Keychain};
-
-use libtx::aggsig;
-use libtx::slate::Slate;
-use libwallet::error::{Error, ErrorKind};
-
-use util::secp::key::{PublicKey, SecretKey};
-use util::secp::{self, pedersen, Secp256k1};
 
 /// Combined trait to allow dynamic wallet dispatch
 pub trait WalletInst<C, K>: WalletBackend<C, K> + Send + Sync + 'static
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 }
 impl<T, C, K> WalletInst<C, K> for T
 where
 	T: WalletBackend<C, K> + Send + Sync + 'static,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
-{}
+{
+}
 
 /// TODO:
 /// Wallets should implement this backend for their storage. All functions
@@ -57,7 +52,7 @@ where
 /// whatever credentials it needs
 pub trait WalletBackend<C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Initialize with whatever stored credentials we have
@@ -69,27 +64,31 @@ where
 	/// Return the keychain being used
 	fn keychain(&mut self) -> &mut K;
 
-	/// Return the client being used
-	fn client(&mut self) -> &mut C;
+	/// Return the client being used to communicate with the node
+	fn w2n_client(&mut self) -> &mut C;
+
+	/// return the commit for caching if allowed, none otherwise
+	fn calc_commit_for_cache(
+		&mut self,
+		amount: u64,
+		id: &Identifier,
+	) -> Result<Option<String>, Error>;
 
 	/// Set parent key id by stored account name
 	fn set_parent_key_id_by_name(&mut self, label: &str) -> Result<(), Error>;
 
 	/// The BIP32 path of the parent path to use for all output-related
 	/// functions, (essentially 'accounts' within a wallet.
-	fn set_parent_key_id(&mut self, Identifier);
+	fn set_parent_key_id(&mut self, _: Identifier);
 
 	/// return the parent path
 	fn parent_key_id(&mut self) -> Identifier;
 
 	/// Iterate over all output data stored by the backend
-	fn iter<'a>(&'a self) -> Box<Iterator<Item = OutputData> + 'a>;
+	fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = OutputData> + 'a>;
 
 	/// Get output data by id
-	fn get(&self, id: &Identifier) -> Result<OutputData, Error>;
-
-	/// Get associated output commitment by id.
-	fn get_commitment(&mut self, id: &Identifier) -> Result<pedersen::Commitment, Error>;
+	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error>;
 
 	/// Get an (Optional) tx log entry by uuid
 	fn get_tx_log_entry(&self, uuid: &Uuid) -> Result<Option<TxLogEntry>, Error>;
@@ -98,16 +97,22 @@ where
 	fn get_private_context(&mut self, slate_id: &[u8]) -> Result<Context, Error>;
 
 	/// Iterate over all output data stored by the backend
-	fn tx_log_iter<'a>(&'a self) -> Box<Iterator<Item = TxLogEntry> + 'a>;
+	fn tx_log_iter<'a>(&'a self) -> Box<dyn Iterator<Item = TxLogEntry> + 'a>;
 
 	/// Iterate over all stored account paths
-	fn acct_path_iter<'a>(&'a self) -> Box<Iterator<Item = AcctPathMapping> + 'a>;
+	fn acct_path_iter<'a>(&'a self) -> Box<dyn Iterator<Item = AcctPathMapping> + 'a>;
 
 	/// Gets an account path for a given label
 	fn get_acct_path(&self, label: String) -> Result<Option<AcctPathMapping>, Error>;
 
+	/// Stores a transaction
+	fn store_tx(&self, uuid: &str, tx: &Transaction) -> Result<(), Error>;
+
+	/// Retrieves a stored transaction from a TxLogEntry
+	fn get_stored_tx(&self, entry: &TxLogEntry) -> Result<Option<Transaction>, Error>;
+
 	/// Create a new write batch to update or remove output data
-	fn batch<'a>(&'a mut self) -> Result<Box<WalletOutputBatch<K> + 'a>, Error>;
+	fn batch<'a>(&'a mut self) -> Result<Box<dyn WalletOutputBatch<K> + 'a>, Error>;
 
 	/// Next child ID when we want to create a new output, based on current parent
 	fn next_child<'a>(&mut self) -> Result<Identifier, Error>;
@@ -117,6 +122,9 @@ where
 
 	/// Attempt to restore the contents of a wallet from seed
 	fn restore(&mut self) -> Result<(), Error>;
+
+	/// Attempt to check and fix wallet state
+	fn check_repair(&mut self) -> Result<(), Error>;
 }
 
 /// Batch trait to update the output data backend atomically. Trying to use a
@@ -135,13 +143,13 @@ where
 	fn save(&mut self, out: OutputData) -> Result<(), Error>;
 
 	/// Gets output data by id
-	fn get(&self, id: &Identifier) -> Result<OutputData, Error>;
+	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error>;
 
 	/// Iterate over all output data stored by the backend
-	fn iter(&self) -> Box<Iterator<Item = OutputData>>;
+	fn iter(&self) -> Box<dyn Iterator<Item = OutputData>>;
 
 	/// Delete data about an output from the backend
-	fn delete(&mut self, id: &Identifier) -> Result<(), Error>;
+	fn delete(&mut self, id: &Identifier, mmr_index: &Option<u64>) -> Result<(), Error>;
 
 	/// Save last stored child index of a given parent
 	fn save_child_index(&mut self, parent_key_id: &Identifier, child_n: u32) -> Result<(), Error>;
@@ -157,16 +165,16 @@ where
 	fn next_tx_log_id(&mut self, parent_key_id: &Identifier) -> Result<u32, Error>;
 
 	/// Iterate over tx log data stored by the backend
-	fn tx_log_iter(&self) -> Box<Iterator<Item = TxLogEntry>>;
+	fn tx_log_iter(&self) -> Box<dyn Iterator<Item = TxLogEntry>>;
 
 	/// save a tx log entry
-	fn save_tx_log_entry(&self, t: TxLogEntry, parent_id: &Identifier) -> Result<(), Error>;
+	fn save_tx_log_entry(&mut self, t: TxLogEntry, parent_id: &Identifier) -> Result<(), Error>;
 
 	/// save an account label -> path mapping
 	fn save_acct_path(&mut self, mapping: AcctPathMapping) -> Result<(), Error>;
 
 	/// Iterate over account names stored in backend
-	fn acct_path_iter(&self) -> Box<Iterator<Item = AcctPathMapping>>;
+	fn acct_path_iter(&self) -> Box<dyn Iterator<Item = AcctPathMapping>>;
 
 	/// Save an output as locked in the backend
 	fn lock_output(&mut self, out: &mut OutputData) -> Result<(), Error>;
@@ -181,20 +189,20 @@ where
 	fn commit(&self) -> Result<(), Error>;
 }
 
-/// Encapsulate all communication functions. No functions within libwallet
+/// Encapsulate all wallet-node communication functions. No functions within libwallet
 /// should care about communication details
-pub trait WalletClient: Sync + Send + Clone {
+pub trait NodeClient: Sync + Send + Clone {
 	/// Return the URL of the check node
 	fn node_url(&self) -> &str;
+
+	/// Set the node URL
+	fn set_node_url(&mut self, node_url: &str);
+
 	/// Return the node api secret
 	fn node_api_secret(&self) -> Option<String>;
 
-	/// Call the wallet API to create a coinbase transaction
-	fn create_coinbase(&self, dest: &str, block_fees: &BlockFees) -> Result<CbData, Error>;
-
-	/// Send a transaction slate to another listening wallet and return result
-	/// TODO: Probably need a slate wrapper type
-	fn send_tx_slate(&self, addr: &str, slate: &Slate) -> Result<Slate, Error>;
+	/// Change the API secret
+	fn set_node_api_secret(&mut self, node_api_secret: Option<String>);
 
 	/// Posts a transaction to a grin node
 	fn post_tx(&self, tx: &TxWrapper, fluff: bool) -> Result<(), Error>;
@@ -207,13 +215,13 @@ pub trait WalletClient: Sync + Send + Clone {
 	fn get_outputs_from_node(
 		&self,
 		wallet_outputs: Vec<pedersen::Commitment>,
-	) -> Result<HashMap<pedersen::Commitment, (String, u64)>, Error>;
+	) -> Result<HashMap<pedersen::Commitment, (String, u64, u64)>, Error>;
 
 	/// Get a list of outputs from the node by traversing the UTXO
 	/// set in PMMR index order.
 	/// Returns
 	/// (last available output index, last insertion index retrieved,
-	/// outputs(commit, proof, is_coinbase, height))
+	/// outputs(commit, proof, is_coinbase, height, mmr_index))
 	fn get_outputs_by_pmmr_index(
 		&self,
 		start_height: u64,
@@ -222,7 +230,7 @@ pub trait WalletClient: Sync + Send + Clone {
 		(
 			u64,
 			u64,
-			Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64)>,
+			Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64, u64)>,
 		),
 		Error,
 	>;
@@ -240,6 +248,11 @@ pub struct OutputData {
 	pub key_id: Identifier,
 	/// How many derivations down from the root key
 	pub n_child: u32,
+	/// The actual commit, optionally stored
+	pub commit: Option<String>,
+	/// PMMR Index, used on restore in case of duplicate wallets using the same
+	/// key_id (2 wallets using same seed, for instance
+	pub mmr_index: Option<u64>,
 	/// Value of the output, necessary to rebuild the commitment
 	pub value: u64,
 	/// Current status of the output
@@ -261,8 +274,8 @@ impl ser::Writeable for OutputData {
 }
 
 impl ser::Readable for OutputData {
-	fn read(reader: &mut ser::Reader) -> Result<OutputData, ser::Error> {
-		let data = reader.read_vec()?;
+	fn read(reader: &mut dyn ser::Reader) -> Result<OutputData, ser::Error> {
+		let data = reader.read_bytes_len_prefix()?;
 		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
 	}
 }
@@ -283,8 +296,6 @@ impl OutputData {
 			return 0;
 		}
 		if self.status == OutputStatus::Unconfirmed {
-			0
-		} else if self.height == 0 {
 			0
 		} else {
 			// if an output has height n and we are at block n
@@ -347,7 +358,7 @@ pub enum OutputStatus {
 }
 
 impl fmt::Display for OutputStatus {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match *self {
 			OutputStatus::Unconfirmed => write!(f, "Unconfirmed"),
 			OutputStatus::Unspent => write!(f, "Unspent"),
@@ -366,9 +377,9 @@ pub struct Context {
 	/// (basically a SecretKey)
 	pub sec_nonce: SecretKey,
 	/// store my outputs between invocations
-	pub output_ids: Vec<Identifier>,
+	pub output_ids: Vec<(Identifier, Option<u64>)>,
 	/// store my inputs
-	pub input_ids: Vec<Identifier>,
+	pub input_ids: Vec<(Identifier, Option<u64>)>,
 	/// store the calculated fee
 	pub fee: u64,
 }
@@ -389,23 +400,23 @@ impl Context {
 impl Context {
 	/// Tracks an output contributing to my excess value (if it needs to
 	/// be kept between invocations
-	pub fn add_output(&mut self, output_id: &Identifier) {
-		self.output_ids.push(output_id.clone());
+	pub fn add_output(&mut self, output_id: &Identifier, mmr_index: &Option<u64>) {
+		self.output_ids.push((output_id.clone(), mmr_index.clone()));
 	}
 
 	/// Returns all stored outputs
-	pub fn get_outputs(&self) -> Vec<Identifier> {
+	pub fn get_outputs(&self) -> Vec<(Identifier, Option<u64>)> {
 		self.output_ids.clone()
 	}
 
 	/// Tracks IDs of my inputs into the transaction
 	/// be kept between invocations
-	pub fn add_input(&mut self, input_id: &Identifier) {
-		self.input_ids.push(input_id.clone());
+	pub fn add_input(&mut self, input_id: &Identifier, mmr_index: &Option<u64>) {
+		self.input_ids.push((input_id.clone(), mmr_index.clone()));
 	}
 
 	/// Returns all stored input identifiers
-	pub fn get_inputs(&self) -> Vec<Identifier> {
+	pub fn get_inputs(&self) -> Vec<(Identifier, Option<u64>)> {
 		self.input_ids.clone()
 	}
 
@@ -430,8 +441,8 @@ impl ser::Writeable for Context {
 }
 
 impl ser::Readable for Context {
-	fn read(reader: &mut ser::Reader) -> Result<Context, ser::Error> {
-		let data = reader.read_vec()?;
+	fn read(reader: &mut dyn ser::Reader) -> Result<Context, ser::Error> {
+		let data = reader.read_bytes_len_prefix()?;
 		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
 	}
 }
@@ -477,7 +488,7 @@ struct BlockIdentifierVisitor;
 impl<'de> serde::de::Visitor<'de> for BlockIdentifierVisitor {
 	type Value = BlockIdentifier;
 
-	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+	fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("a block hash")
 	}
 
@@ -525,6 +536,8 @@ pub struct CbData {
 pub struct WalletInfo {
 	/// height from which info was taken
 	pub last_confirmed_height: u64,
+	/// Minimum number of confirmations for an output to be treated as "spendable".
+	pub minimum_confirmations: u64,
 	/// total amount in the wallet
 	pub total: u64,
 	/// amount awaiting confirmation
@@ -553,13 +566,13 @@ pub enum TxLogEntryType {
 }
 
 impl fmt::Display for TxLogEntryType {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match *self {
-			TxLogEntryType::ConfirmedCoinbase => write!(f, "Confirmed Coinbase"),
+			TxLogEntryType::ConfirmedCoinbase => write!(f, "Confirmed \nCoinbase"),
 			TxLogEntryType::TxReceived => write!(f, "Received Tx"),
 			TxLogEntryType::TxSent => write!(f, "Sent Tx"),
-			TxLogEntryType::TxReceivedCancelled => write!(f, "Received Tx - Cancelled"),
-			TxLogEntryType::TxSentCancelled => write!(f, "Send Tx - Cancelled"),
+			TxLogEntryType::TxReceivedCancelled => write!(f, "Received Tx\n- Cancelled"),
+			TxLogEntryType::TxSentCancelled => write!(f, "Sent Tx\n- Cancelled"),
 		}
 	}
 }
@@ -597,8 +610,8 @@ pub struct TxLogEntry {
 	pub amount_debited: u64,
 	/// Fee
 	pub fee: Option<u64>,
-	/// The transaction json itself, stored for reference or resending
-	pub tx_hex: Option<String>,
+	/// Location of the store transaction, (reference or resending)
+	pub stored_tx: Option<String>,
 }
 
 impl ser::Writeable for TxLogEntry {
@@ -608,8 +621,8 @@ impl ser::Writeable for TxLogEntry {
 }
 
 impl ser::Readable for TxLogEntry {
-	fn read(reader: &mut ser::Reader) -> Result<TxLogEntry, ser::Error> {
-		let data = reader.read_vec()?;
+	fn read(reader: &mut dyn ser::Reader) -> Result<TxLogEntry, ser::Error> {
+		let data = reader.read_bytes_len_prefix()?;
 		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
 	}
 }
@@ -630,8 +643,16 @@ impl TxLogEntry {
 			num_inputs: 0,
 			num_outputs: 0,
 			fee: None,
-			tx_hex: None,
+			stored_tx: None,
 		}
+	}
+
+	/// Given a vec of TX log entries, return credited + debited sums
+	pub fn sum_confirmed(txs: &Vec<TxLogEntry>) -> (u64, u64) {
+		txs.iter().fold((0, 0), |acc, tx| match tx.confirmed {
+			true => (acc.0 + tx.amount_credited, acc.1 + tx.amount_debited),
+			false => acc,
+		})
 	}
 
 	/// Update confirmation TS with now
@@ -656,8 +677,8 @@ impl ser::Writeable for AcctPathMapping {
 }
 
 impl ser::Readable for AcctPathMapping {
-	fn read(reader: &mut ser::Reader) -> Result<AcctPathMapping, ser::Error> {
-		let data = reader.read_vec()?;
+	fn read(reader: &mut dyn ser::Reader) -> Result<AcctPathMapping, ser::Error> {
+		let data = reader.read_bytes_len_prefix()?;
 		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
 	}
 }
@@ -686,4 +707,6 @@ pub struct SendTXArgs {
 	pub num_change_outputs: usize,
 	/// whether to use all outputs (combine)
 	pub selection_strategy_is_use_all: bool,
+	/// Optional message, that will be signed
+	pub message: Option<String>,
 }

@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::util::RwLock;
 use std::convert::From;
 use std::fs::File;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
 use std::sync::Arc;
-use util::RwLock;
 
 use chrono::prelude::*;
 
-use core::core::hash::Hash;
-use core::pow::Difficulty;
-use core::{core, ser};
+use crate::core::core::hash::Hash;
+use crate::core::pow::Difficulty;
+use crate::core::{core, ser};
 use grin_store;
 
 /// Maximum number of block headers a peer should ever send
@@ -55,6 +55,7 @@ pub enum Error {
 	Connection(io::Error),
 	/// Header type does not match the expected message type
 	BadMessage,
+	MsgLen,
 	Banned,
 	ConnectionClose,
 	Timeout,
@@ -123,6 +124,8 @@ pub struct P2PConfig {
 	pub peer_max_count: Option<u32>,
 
 	pub peer_min_preferred_count: Option<u32>,
+
+	pub dandelion_peer: Option<SocketAddr>,
 }
 
 /// Default address for peer-to-peer connections.
@@ -131,7 +134,7 @@ impl Default for P2PConfig {
 		let ipaddr = "0.0.0.0".parse().unwrap();
 		P2PConfig {
 			host: ipaddr,
-			port: 13414,
+			port: 3414,
 			capabilities: Capabilities::FULL_NODE,
 			seeding_type: Seeding::default(),
 			seeds: None,
@@ -141,6 +144,7 @@ impl Default for P2PConfig {
 			ban_window: None,
 			peer_max_count: None,
 			peer_min_preferred_count: None,
+			dandelion_peer: None,
 		}
 	}
 }
@@ -206,13 +210,17 @@ bitflags! {
 		const TXHASHSET_HIST = 0b00000010;
 		/// Can provide a list of healthy peers
 		const PEER_LIST = 0b00000100;
+		/// Can broadcast and request txs by kernel hash.
+		const TX_KERNEL_HASH = 0b00001000;
 
 		/// All nodes right now are "full nodes".
 		/// Some nodes internally may maintain longer block histories (archival_mode)
 		/// but we do not advertise this to other nodes.
+		/// All nodes by default will accept lightweight "kernel first" tx broadcast.
 		const FULL_NODE = Capabilities::HEADER_HIST.bits
 			| Capabilities::TXHASHSET_HIST.bits
-			| Capabilities::PEER_LIST.bits;
+			| Capabilities::PEER_LIST.bits
+			| Capabilities::TX_KERNEL_HASH.bits;
 	}
 }
 
@@ -235,6 +243,8 @@ enum_from_primitive! {
 		BadBlockHeader = 3,
 		BadTxHashSet = 4,
 		ManualBan = 5,
+		FraudHeight = 6,
+		BadHandshake = 7,
 	}
 }
 
@@ -337,11 +347,15 @@ pub trait ChainAdapter: Sync + Send {
 	/// A valid transaction has been received from one of our peers
 	fn transaction_received(&self, tx: core::Transaction, stem: bool);
 
+	fn get_transaction(&self, kernel_hash: Hash) -> Option<core::Transaction>;
+
+	fn tx_kernel_received(&self, kernel_hash: Hash, addr: SocketAddr);
+
 	/// A block has been received from one of our peers. Returns true if the
 	/// block could be handled properly and is not deemed defective by the
 	/// chain. Returning false means the block will never be valid and
 	/// may result in the peer being banned.
-	fn block_received(&self, b: core::Block, addr: SocketAddr) -> bool;
+	fn block_received(&self, b: core::Block, addr: SocketAddr, was_requested: bool) -> bool;
 
 	fn compact_block_received(&self, cb: core::CompactBlock, addr: SocketAddr) -> bool;
 
@@ -350,12 +364,12 @@ pub trait ChainAdapter: Sync + Send {
 	/// A set of block header has been received, typically in response to a
 	/// block
 	/// header request.
-	fn headers_received(&self, bh: Vec<core::BlockHeader>, addr: SocketAddr) -> bool;
+	fn headers_received(&self, bh: &[core::BlockHeader], addr: SocketAddr) -> bool;
 
 	/// Finds a list of block headers based on the provided locator. Tries to
 	/// identify the common chain and gets the headers that follow it
 	/// immediately.
-	fn locate_headers(&self, locator: Vec<Hash>) -> Vec<core::BlockHeader>;
+	fn locate_headers(&self, locator: &[Hash]) -> Vec<core::BlockHeader>;
 
 	/// Gets a full block by its hash.
 	fn get_block(&self, h: Hash) -> Option<core::Block>;
@@ -394,10 +408,10 @@ pub trait NetAdapter: ChainAdapter {
 	fn find_peer_addrs(&self, capab: Capabilities) -> Vec<SocketAddr>;
 
 	/// A list of peers has been received from one of our peers.
-	fn peer_addrs_received(&self, Vec<SocketAddr>);
+	fn peer_addrs_received(&self, _: Vec<SocketAddr>);
 
 	/// Heard total_difficulty from a connected peer (via ping/pong).
-	fn peer_difficulty(&self, SocketAddr, Difficulty, u64);
+	fn peer_difficulty(&self, _: SocketAddr, _: Difficulty, _: u64);
 
 	/// Is this peer currently banned?
 	fn is_banned(&self, addr: SocketAddr) -> bool;

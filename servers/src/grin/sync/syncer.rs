@@ -12,29 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time;
 
-use chain;
-use common::types::{SyncState, SyncStatus};
-use core::pow::Difficulty;
-use grin::sync::body_sync::BodySync;
-use grin::sync::header_sync::HeaderSync;
-use grin::sync::state_sync::StateSync;
-use p2p;
+use crate::chain;
+use crate::common::types::{SyncState, SyncStatus};
+use crate::core::global;
+use crate::core::pow::Difficulty;
+use crate::grin::sync::body_sync::BodySync;
+use crate::grin::sync::header_sync::HeaderSync;
+use crate::grin::sync::state_sync::StateSync;
+use crate::p2p;
+use crate::util::{Mutex, StopState};
 
 pub fn run_sync(
 	sync_state: Arc<SyncState>,
 	peers: Arc<p2p::Peers>,
 	chain: Arc<chain::Chain>,
-	stop: Arc<AtomicBool>,
+	stop_state: Arc<Mutex<StopState>>,
 ) {
 	let _ = thread::Builder::new()
 		.name("sync".to_string())
 		.spawn(move || {
-			let runner = SyncRunner::new(sync_state, peers, chain, stop);
+			let runner = SyncRunner::new(sync_state, peers, chain, stop_state);
 			runner.sync_loop();
 		});
 }
@@ -43,7 +44,7 @@ pub struct SyncRunner {
 	sync_state: Arc<SyncState>,
 	peers: Arc<p2p::Peers>,
 	chain: Arc<chain::Chain>,
-	stop: Arc<AtomicBool>,
+	stop_state: Arc<Mutex<StopState>>,
 }
 
 impl SyncRunner {
@@ -51,13 +52,13 @@ impl SyncRunner {
 		sync_state: Arc<SyncState>,
 		peers: Arc<p2p::Peers>,
 		chain: Arc<chain::Chain>,
-		stop: Arc<AtomicBool>,
+		stop_state: Arc<Mutex<StopState>>,
 	) -> SyncRunner {
 		SyncRunner {
 			sync_state,
 			peers,
 			chain,
-			stop,
+			stop_state,
 		}
 	}
 
@@ -76,18 +77,20 @@ impl SyncRunner {
 		let mut n = 0;
 		const MIN_PEERS: usize = 3;
 		loop {
-			let wp = self.peers.more_work_peers();
+			let wp = self.peers.more_or_same_work_peers();
 			// exit loop when:
-			// * we have more than MIN_PEERS more_work peers
+			// * we have more than MIN_PEERS more_or_same_work peers
 			// * we are synced already, e.g. grin was quickly restarted
 			// * timeout
-			if wp.len() > MIN_PEERS
-				|| (wp.len() == 0
+			if wp > MIN_PEERS
+				|| (wp == 0
 					&& self.peers.enough_peers()
 					&& head.total_difficulty > Difficulty::zero())
 				|| n > wait_secs
 			{
-				break;
+				if wp > 0 || !global::is_production_mode() {
+					break;
+				}
 			}
 			thread::sleep(time::Duration::from_secs(1));
 			n += 1;
@@ -121,7 +124,11 @@ impl SyncRunner {
 		let mut highest_height = 0;
 
 		// Main syncing loop
-		while !self.stop.load(Ordering::Relaxed) {
+		loop {
+			if self.stop_state.lock().is_stopped() {
+				break;
+			}
+
 			thread::sleep(time::Duration::from_millis(10));
 
 			// check whether syncing is generally needed, when we compare our state with others
@@ -141,13 +148,34 @@ impl SyncRunner {
 
 			// if syncing is needed
 			let head = self.chain.head().unwrap();
+			let tail = self.chain.tail().unwrap_or_else(|_| head.clone());
 			let header_head = self.chain.header_head().unwrap();
 
 			// run each sync stage, each of them deciding whether they're needed
-			// except for body sync that only runs if state sync is off or done
+			// except for state sync that only runs if body sync return true (means txhashset is needed)
 			header_sync.check_run(&header_head, highest_height);
-			if !state_sync.check_run(&header_head, &head, highest_height) {
-				body_sync.check_run(&head, highest_height);
+
+			let mut check_state_sync = false;
+			match self.sync_state.status() {
+				SyncStatus::TxHashsetDownload { .. }
+				| SyncStatus::TxHashsetSetup
+				| SyncStatus::TxHashsetValidation { .. }
+				| SyncStatus::TxHashsetSave
+				| SyncStatus::TxHashsetDone => check_state_sync = true,
+				_ => {
+					// skip body sync if header chain is not synced.
+					if header_head.height < highest_height {
+						continue;
+					}
+
+					if body_sync.check_run(&head, highest_height) {
+						check_state_sync = true;
+					}
+				}
+			}
+
+			if check_state_sync {
+				state_sync.check_run(&header_head, &head, &tail, highest_height);
 			}
 		}
 	}
@@ -156,55 +184,49 @@ impl SyncRunner {
 	/// just receiving blocks through gossip.
 	fn needs_syncing(&self) -> (bool, u64) {
 		let local_diff = self.chain.head().unwrap().total_difficulty;
+		let mut is_syncing = self.sync_state.is_syncing();
 		let peer = self.peers.most_work_peer();
-		let is_syncing = self.sync_state.is_syncing();
-		let mut most_work_height = 0;
+
+		let peer_info = if let Some(p) = peer {
+			p.info.clone()
+		} else {
+			warn!("sync: no peers available, disabling sync");
+			return (false, 0);
+		};
 
 		// if we're already syncing, we're caught up if no peer has a higher
 		// difficulty than us
 		if is_syncing {
-			if let Some(peer) = peer {
-				most_work_height = peer.info.height();
-				if peer.info.total_difficulty() <= local_diff {
-					let ch = self.chain.head().unwrap();
-					info!(
-						"synchronized at {} @ {} [{}]",
-						local_diff.to_num(),
-						ch.height,
-						ch.last_block_h
-					);
-
-					let _ = self.chain.reset_head();
-					return (false, most_work_height);
-				}
-			} else {
-				warn!("sync: no peers available, disabling sync");
-				return (false, 0);
+			if peer_info.total_difficulty() <= local_diff {
+				let ch = self.chain.head().unwrap();
+				info!(
+					"synchronized at {} @ {} [{}]",
+					local_diff.to_num(),
+					ch.height,
+					ch.last_block_h
+				);
+				is_syncing = false;
 			}
 		} else {
-			if let Some(peer) = peer {
-				most_work_height = peer.info.height();
+			// sum the last 5 difficulties to give us the threshold
+			let threshold = self
+				.chain
+				.difficulty_iter()
+				.map(|x| x.difficulty)
+				.take(5)
+				.fold(Difficulty::zero(), |sum, val| sum + val);
 
-				// sum the last 5 difficulties to give us the threshold
-				let threshold = self
-					.chain
-					.difficulty_iter()
-					.map(|x| x.difficulty)
-					.take(5)
-					.fold(Difficulty::zero(), |sum, val| sum + val);
-
-				let peer_diff = peer.info.total_difficulty();
-				if peer_diff > local_diff.clone() + threshold.clone() {
-					info!(
-						"sync: total_difficulty {}, peer_difficulty {}, threshold {} (last 5 blocks), enabling sync",
-						local_diff,
-						peer_diff,
-						threshold,
-						);
-					return (true, most_work_height);
-				}
+			let peer_diff = peer_info.total_difficulty();
+			if peer_diff > local_diff.clone() + threshold.clone() {
+				info!(
+					"sync: total_difficulty {}, peer_difficulty {}, threshold {} (last 5 blocks), enabling sync",
+					local_diff,
+					peer_diff,
+					threshold,
+				);
+				is_syncing = true;
 			}
 		}
-		(is_syncing, most_work_height)
+		(is_syncing, peer_info.height())
 	}
 }

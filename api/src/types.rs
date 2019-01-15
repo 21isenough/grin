@@ -14,17 +14,17 @@
 
 use std::sync::Arc;
 
-use chain;
-use core::core::hash::Hashed;
-use core::core::merkle_proof::MerkleProof;
-use core::{core, ser};
-use p2p;
+use crate::chain;
+use crate::core::core::hash::Hashed;
+use crate::core::core::merkle_proof::MerkleProof;
+use crate::core::{core, ser};
+use crate::p2p;
+use crate::util;
+use crate::util::secp::pedersen;
 use serde;
 use serde::de::MapAccess;
 use serde::ser::SerializeStruct;
 use std::fmt;
-use util;
-use util::secp::pedersen;
 
 macro_rules! no_dup {
 	($field:ident) => {
@@ -159,15 +159,18 @@ pub struct Output {
 	pub commit: PrintableCommitment,
 	/// Height of the block which contains the output
 	pub height: u64,
+	/// MMR Index of output
+	pub mmr_index: u64,
 }
 
 impl Output {
-	pub fn new(commit: &pedersen::Commitment, height: u64) -> Output {
+	pub fn new(commit: &pedersen::Commitment, height: u64, mmr_index: u64) -> Output {
 		Output {
 			commit: PrintableCommitment {
 				commit: commit.clone(),
 			},
 			height: height,
+			mmr_index: mmr_index,
 		}
 	}
 }
@@ -210,7 +213,7 @@ struct PrintableCommitmentVisitor;
 impl<'de> serde::de::Visitor<'de> for PrintableCommitmentVisitor {
 	type Value = PrintableCommitment;
 
-	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+	fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("a Pedersen commitment")
 	}
 
@@ -242,6 +245,8 @@ pub struct OutputPrintable {
 	pub block_height: Option<u64>,
 	/// Merkle Proof
 	pub merkle_proof: Option<MerkleProof>,
+	/// MMR Position
+	pub mmr_index: u64,
 }
 
 impl OutputPrintable {
@@ -251,10 +256,7 @@ impl OutputPrintable {
 		block_header: Option<&core::BlockHeader>,
 		include_proof: bool,
 	) -> OutputPrintable {
-		let output_type = if output
-			.features
-			.contains(core::transaction::OutputFeatures::COINBASE_OUTPUT)
-		{
+		let output_type = if output.is_coinbase() {
 			OutputType::Coinbase
 		} else {
 			OutputType::Transaction
@@ -278,13 +280,11 @@ impl OutputPrintable {
 		// We require the rewind() to be stable even after the PMMR is pruned and
 		// compacted so we can still recreate the necessary proof.
 		let mut merkle_proof = None;
-		if output
-			.features
-			.contains(core::transaction::OutputFeatures::COINBASE_OUTPUT)
-			&& !spent && block_header.is_some()
-		{
+		if output.is_coinbase() && !spent && block_header.is_some() {
 			merkle_proof = chain.get_merkle_proof(&out_id, &block_header.unwrap()).ok()
 		};
+
+		let output_pos = chain.get_output_pos(&output.commit).unwrap_or(0);
 
 		OutputPrintable {
 			output_type,
@@ -294,6 +294,7 @@ impl OutputPrintable {
 			proof_hash: util::to_hex(output.proof.hash().to_vec()),
 			block_height,
 			merkle_proof,
+			mmr_index: output_pos,
 		}
 	}
 
@@ -334,6 +335,7 @@ impl serde::ser::Serialize for OutputPrintable {
 
 		let hex_merkle_proof = &self.merkle_proof.clone().map(|x| x.to_hex());
 		state.serialize_field("merkle_proof", &hex_merkle_proof)?;
+		state.serialize_field("mmr_index", &self.mmr_index)?;
 
 		state.end()
 	}
@@ -354,6 +356,7 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 			ProofHash,
 			BlockHeight,
 			MerkleProof,
+			MmrIndex,
 		}
 
 		struct OutputPrintableVisitor;
@@ -361,7 +364,7 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 		impl<'de> serde::de::Visitor<'de> for OutputPrintableVisitor {
 			type Value = OutputPrintable;
 
-			fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+			fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 				formatter.write_str("a print able Output")
 			}
 
@@ -376,6 +379,7 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 				let mut proof_hash = None;
 				let mut block_height = None;
 				let mut merkle_proof = None;
+				let mut mmr_index = None;
 
 				while let Some(key) = map.next_key()? {
 					match key {
@@ -417,6 +421,10 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 								}
 							}
 						}
+						Field::MmrIndex => {
+							no_dup!(mmr_index);
+							mmr_index = Some(map.next_value()?)
+						}
 					}
 				}
 
@@ -428,12 +436,19 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 					proof_hash: proof_hash.unwrap(),
 					block_height: block_height,
 					merkle_proof: merkle_proof,
+					mmr_index: mmr_index.unwrap(),
 				})
 			}
 		}
 
-		const FIELDS: &'static [&'static str] =
-			&["output_type", "commit", "spent", "proof", "proof_hash"];
+		const FIELDS: &'static [&'static str] = &[
+			"output_type",
+			"commit",
+			"spent",
+			"proof",
+			"proof_hash",
+			"mmr_index",
+		];
 		deserializer.deserialize_struct("OutputPrintable", FIELDS, OutputPrintableVisitor)
 	}
 }
@@ -472,11 +487,11 @@ pub struct BlockHeaderInfo {
 }
 
 impl BlockHeaderInfo {
-	pub fn from_header(h: &core::BlockHeader) -> BlockHeaderInfo {
+	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderInfo {
 		BlockHeaderInfo {
-			hash: util::to_hex(h.hash().to_vec()),
-			height: h.height,
-			previous: util::to_hex(h.previous.to_vec()),
+			hash: util::to_hex(header.hash().to_vec()),
+			height: header.height,
+			previous: util::to_hex(header.prev_hash.to_vec()),
 		}
 	}
 }
@@ -516,23 +531,23 @@ pub struct BlockHeaderPrintable {
 }
 
 impl BlockHeaderPrintable {
-	pub fn from_header(h: &core::BlockHeader) -> BlockHeaderPrintable {
+	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderPrintable {
 		BlockHeaderPrintable {
-			hash: util::to_hex(h.hash().to_vec()),
-			version: h.version,
-			height: h.height,
-			previous: util::to_hex(h.previous.to_vec()),
-			prev_root: util::to_hex(h.prev_root.to_vec()),
-			timestamp: h.timestamp.to_rfc3339(),
-			output_root: util::to_hex(h.output_root.to_vec()),
-			range_proof_root: util::to_hex(h.range_proof_root.to_vec()),
-			kernel_root: util::to_hex(h.kernel_root.to_vec()),
-			nonce: h.pow.nonce,
-			edge_bits: h.pow.edge_bits(),
-			cuckoo_solution: h.pow.proof.nonces.clone(),
-			total_difficulty: h.pow.total_difficulty.to_num(),
-			secondary_scaling: h.pow.secondary_scaling,
-			total_kernel_offset: h.total_kernel_offset.to_hex(),
+			hash: util::to_hex(header.hash().to_vec()),
+			version: header.version,
+			height: header.height,
+			previous: util::to_hex(header.prev_hash.to_vec()),
+			prev_root: util::to_hex(header.prev_root.to_vec()),
+			timestamp: header.timestamp.to_rfc3339(),
+			output_root: util::to_hex(header.output_root.to_vec()),
+			range_proof_root: util::to_hex(header.range_proof_root.to_vec()),
+			kernel_root: util::to_hex(header.kernel_root.to_vec()),
+			nonce: header.pow.nonce,
+			edge_bits: header.pow.edge_bits(),
+			cuckoo_solution: header.pow.proof.nonces.clone(),
+			total_difficulty: header.pow.total_difficulty.to_num(),
+			secondary_scaling: header.pow.secondary_scaling,
+			total_kernel_offset: header.total_kernel_offset.to_hex(),
 		}
 	}
 }
@@ -571,7 +586,8 @@ impl BlockPrintable {
 					Some(&block.header),
 					include_proof,
 				)
-			}).collect();
+			})
+			.collect();
 		let kernels = block
 			.kernels()
 			.iter()
@@ -668,7 +684,8 @@ mod test {
 			 \"proof\":null,\
 			 \"proof_hash\":\"ed6ba96009b86173bade6a9227ed60422916593fa32dd6d78b25b7a4eeef4946\",\
 			 \"block_height\":0,\
-			 \"merkle_proof\":null\
+			 \"merkle_proof\":null,\
+			 \"mmr_index\":0\
 			 }";
 		let deserialized: OutputPrintable = serde_json::from_str(&hex_output).unwrap();
 		let serialized = serde_json::to_string(&deserialized).unwrap();
@@ -680,7 +697,8 @@ mod test {
 		let hex_commit =
 			"{\
 			 \"commit\":\"083eafae5d61a85ab07b12e1a51b3918d8e6de11fc6cde641d54af53608aa77b9f\",\
-			 \"height\":0\
+			 \"height\":0,\
+			 \"mmr_index\":0\
 			 }";
 		let deserialized: Output = serde_json::from_str(&hex_commit).unwrap();
 		let serialized = serde_json::to_string(&deserialized).unwrap();

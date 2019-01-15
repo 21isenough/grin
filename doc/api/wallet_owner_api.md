@@ -7,11 +7,13 @@
     1. [GET Retrieve Summary Info](#get-retrieve-summary-info)
     1. [GET Node Height](#get-node-height)
     1. [GET Retrieve Txs](#get-retrieve-txs)
-    1. [GET Dump Stored Tx](#get-dump-stored-tx)
+    1. [GET Retrieve Stored Tx](#get-retrieve-stored-tx)
     1. [POST Issue Send Tx](#post-issue-send-tx)
     1. [POST Finalize Tx](#post-finalize-tx)
     1. [POST Cancel Tx](#post-cancel-tx)
+    1. [POST Post Tx](#post-post-tx)
     1. [POST Issue Burn Tx](#post-issue-burn-tx)
+    1. [Adding Foreign API Endpoints](#add-foreign-api-endpoints)
 
 ## Wallet Owner Endpoint
 
@@ -189,8 +191,9 @@ Return whether the outputs were validated against a node and an array of TxLogEn
 
 * **URL**
 
-  */v1/wallet/owner/retrieve_txs
-  */v1/wallet/owner/retrieve_txs?refresh?id=x
+  * /v1/wallet/owner/retrieve_txs
+  * /v1/wallet/owner/retrieve_txs?refresh&id=x
+  * /v1/wallet/owner/retrieve_txs?tx_id=x
 
 * **Method:**
 
@@ -200,8 +203,9 @@ Return whether the outputs were validated against a node and an array of TxLogEn
 
   **Optional:**
 
-  `refresh` to refresh from node
-  `tx_id=[number]` to retrieve only the specified output
+  * `refresh` to refresh from node
+  * `id=[number]` to retrieve only the specified output by id
+  * `tx_id=[string]` to retrieve only the specified output by tx id
 
 * **Data Params**
 
@@ -249,13 +253,13 @@ Return whether the outputs were validated against a node and an array of TxLogEn
     });
   ```
 
-### GET Dump Stored Tx
+### GET Retrieve Stored Tx
 
 Retrieves a given transaction.
 
 * **URL**
 
-  /v1/wallet/owner/dump_stored_tx?id=x
+  /v1/wallet/owner/retrieve_stored_tx?id=x
 
 * **Method:**
 
@@ -305,7 +309,7 @@ Retrieves a given transaction.
 
   ```javascript
     $.ajax({
-      url: "/v1/wallet/owner/dump_stored_tx?id=13",
+      url: "/v1/wallet/owner/retrieve_stored_tx?id=13",
       dataType: "json",
       type : "GET",
       success : function(r) {
@@ -343,7 +347,6 @@ Send a transaction either directly by http or file (then display the slate)
     | max_outputs                   | number   | Max number of outputs                |
     | num_change_outputs            | number   | Number of change outputs to generate |
     | selection_strategy_is_use_all | bool     | Whether to use all outputs (combine) |
-    | fluff                         | bool     | Dandelion control                    |
 
 * **Success Response:**
 
@@ -406,7 +409,7 @@ Send a transaction either directly by http or file (then display the slate)
 ### POST Finalize Tx
 
 Sender finalization of the transaction. Takes the slate returned by the sender as well as the private file generate on the first send step.
-Builds the complete transaction and sends it to a grin node for propagation.
+Builds the complete transaction but will **not** sends it to a grin node for propagation. Use [POST Post Tx](#post-post-tx) for that.
 
 * **URL**
 
@@ -521,7 +524,8 @@ Roll back a transaction and all associated outputs with a given transaction id T
 
 * **URL**
 
-  /v1/wallet/owner/cancel_tx?id=x
+  * /v1/wallet/owner/cancel_tx?id=x
+  * /v1/wallet/owner/cancel_tx?tx_id=x
 
 * **Method:**
 
@@ -530,7 +534,8 @@ Roll back a transaction and all associated outputs with a given transaction id T
 * **URL Params**
 
   **Required:**
-  `id=[number]`
+  * `id=[number]` the transaction id
+  * `tx_id=[string]`the transaction slate id
 
 * **Data Params**
 
@@ -563,7 +568,8 @@ Push new transaction to the connected node transaction pool. Add `?fluff` at the
 
 * **URL**
 
-  /v1/wallet/owner/post_tx
+  * /v1/wallet/owner/post_tx
+  * /v1/wallet/owner/post_tx?fluff
 
 * **Method:**
 
@@ -571,7 +577,9 @@ Push new transaction to the connected node transaction pool. Add `?fluff` at the
   
 * **URL Params**
 
-  None
+   **Optional:**
+
+  `fluff` to bypass Dandelion relay
 
 * **Data Params**
 
@@ -674,3 +682,7 @@ Issue a burn TX.
       }
     });
   ```
+
+### Add Foreign API Endpoints
+
+For some environments it may be convenient to have the [wallet foreign API](wallet_foreign_api.md) available on the same port as the owner API.  You can do so by setting the `owner_api_include_foreign` configuration setting to `true`.

@@ -22,7 +22,7 @@ use lmdb_zero as lmdb;
 use lmdb_zero::traits::CreateCursor;
 use lmdb_zero::LmdbResultExt;
 
-use core::ser;
+use crate::core::ser;
 
 /// Main error type for this lmdb
 #[derive(Clone, Eq, PartialEq, Debug, Fail)]
@@ -67,15 +67,17 @@ pub fn new_env(path: String) -> lmdb::Environment {
 pub fn new_named_env(path: String, name: String) -> lmdb::Environment {
 	let full_path = [path, name].join("/");
 	fs::create_dir_all(&full_path).unwrap();
-	unsafe {
-		let mut env_builder = lmdb::EnvBuilder::new().unwrap();
-		env_builder.set_maxdbs(8).unwrap();
-		// half a TB should give us plenty room, will be an issue on 32 bits
-		// (which we don't support anyway)
-		env_builder.set_mapsize(549755813888).unwrap_or_else(|e| {
+
+	let mut env_builder = lmdb::EnvBuilder::new().unwrap();
+	env_builder.set_maxdbs(8).unwrap();
+	// half a TB should give us plenty room, will be an issue on 32 bits
+	// (which we don't support anyway)
+	env_builder
+		.set_mapsize(549_755_813_888)
+		.unwrap_or_else(|e| {
 			panic!("Unable to allocate LMDB space: {:?}", e);
 		});
-
+	unsafe {
 		env_builder
 			.open(&full_path, lmdb::open::Flags::empty(), 0o600)
 			.unwrap()
@@ -98,7 +100,8 @@ impl Store {
 				env.clone(),
 				Some(name),
 				&lmdb::DatabaseOptions::new(lmdb::db::CREATE),
-			).unwrap(),
+			)
+			.unwrap(),
 		);
 		Store { env, db }
 	}
@@ -124,7 +127,7 @@ impl Store {
 	fn get_ser_access<T: ser::Readable>(
 		&self,
 		key: &[u8],
-		access: &lmdb::ConstAccessor,
+		access: &lmdb::ConstAccessor<'_>,
 	) -> Result<Option<T>, Error> {
 		let res: lmdb::error::Result<&[u8]> = access.get(&self.db, key);
 		match res.to_opt() {
@@ -148,11 +151,11 @@ impl Store {
 	/// Produces an iterator of `Readable` types moving forward from the
 	/// provided key.
 	pub fn iter<T: ser::Readable>(&self, from: &[u8]) -> Result<SerIterator<T>, Error> {
-		let txn = Arc::new(lmdb::ReadTransaction::new(self.env.clone())?);
-		let cursor = Arc::new(txn.cursor(self.db.clone()).unwrap());
+		let tx = Arc::new(lmdb::ReadTransaction::new(self.env.clone())?);
+		let cursor = Arc::new(tx.cursor(self.db.clone()).unwrap());
 		Ok(SerIterator {
-			tx: txn,
-			cursor: cursor,
+			tx,
+			cursor,
 			seek: false,
 			prefix: from.to_vec(),
 			_marker: marker::PhantomData,
@@ -160,7 +163,7 @@ impl Store {
 	}
 
 	/// Builds a new batch to be used with this store.
-	pub fn batch(&self) -> Result<Batch, Error> {
+	pub fn batch(&self) -> Result<Batch<'_>, Error> {
 		let txn = lmdb::WriteTransaction::new(self.env.clone())?;
 		Ok(Batch {
 			store: self,
@@ -177,10 +180,10 @@ pub struct Batch<'a> {
 
 impl<'a> Batch<'a> {
 	/// Writes a single key/value pair to the db
-	pub fn put(&self, key: &[u8], value: Vec<u8>) -> Result<(), Error> {
+	pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
 		self.tx
 			.access()
-			.put(&self.store.db, key, &value, lmdb::put::Flags::empty())?;
+			.put(&self.store.db, key, value, lmdb::put::Flags::empty())?;
 		Ok(())
 	}
 
@@ -189,7 +192,7 @@ impl<'a> Batch<'a> {
 	pub fn put_ser<W: ser::Writeable>(&self, key: &[u8], value: &W) -> Result<(), Error> {
 		let ser_value = ser::ser_vec(value);
 		match ser_value {
-			Ok(data) => self.put(key, data),
+			Ok(data) => self.put(key, &data),
 			Err(err) => Err(Error::SerErr(format!("{}", err))),
 		}
 	}
@@ -231,7 +234,7 @@ impl<'a> Batch<'a> {
 
 	/// Creates a child of this batch. It will be merged with its parent on
 	/// commit, abandoned otherwise.
-	pub fn child(&mut self) -> Result<Batch, Error> {
+	pub fn child(&mut self) -> Result<Batch<'_>, Error> {
 		Ok(Batch {
 			store: self.store,
 			tx: self.tx.child_tx()?,

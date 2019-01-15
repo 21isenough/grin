@@ -14,22 +14,25 @@
 
 use std::fs::File;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
 
-use lmdb;
+use crate::lmdb;
 
+use crate::core::core;
+use crate::core::core::hash::Hash;
+use crate::core::global;
+use crate::core::pow::Difficulty;
+use crate::handshake::Handshake;
+use crate::peer::Peer;
+use crate::peers::Peers;
+use crate::store::PeerStore;
+use crate::types::{
+	Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, ReasonForBan, Seeding, TxHashSetRead,
+};
+use crate::util::{Mutex, StopState};
 use chrono::prelude::{DateTime, Utc};
-use core::core;
-use core::core::hash::Hash;
-use core::pow::Difficulty;
-use handshake::Handshake;
-use peer::Peer;
-use peers::Peers;
-use store::PeerStore;
-use types::{Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, TxHashSetRead};
 
 /// P2P server implementation, handling bootstrapping to find and connect to
 /// peers, receiving connections from other peers and keep track of all of them.
@@ -38,11 +41,8 @@ pub struct Server {
 	capabilities: Capabilities,
 	handshake: Arc<Handshake>,
 	pub peers: Arc<Peers>,
-	stop: Arc<AtomicBool>,
+	stop_state: Arc<Mutex<StopState>>,
 }
-
-unsafe impl Sync for Server {}
-unsafe impl Send for Server {}
 
 // TODO TLS
 impl Server {
@@ -51,16 +51,16 @@ impl Server {
 		db_env: Arc<lmdb::Environment>,
 		capab: Capabilities,
 		config: P2PConfig,
-		adapter: Arc<ChainAdapter>,
+		adapter: Arc<dyn ChainAdapter>,
 		genesis: Hash,
-		stop: Arc<AtomicBool>,
+		stop_state: Arc<Mutex<StopState>>,
 	) -> Result<Server, Error> {
 		Ok(Server {
 			config: config.clone(),
 			capabilities: capab,
 			handshake: Arc::new(Handshake::new(genesis, config.clone())),
 			peers: Arc::new(Peers::new(PeerStore::new(db_env)?, adapter, config)),
-			stop: stop,
+			stop_state,
 		})
 	}
 
@@ -74,22 +74,30 @@ impl Server {
 
 		let sleep_time = Duration::from_millis(1);
 		loop {
+			// Pause peer ingress connection request. Only for tests.
+			if self.stop_state.lock().is_paused() {
+				thread::sleep(Duration::from_secs(1));
+				continue;
+			}
+
 			match listener.accept() {
 				Ok((stream, peer_addr)) => {
-					if !self.check_banned(&stream) {
-						if let Err(e) = self.handle_new_peer(stream) {
-							warn!("Error accepting peer {}: {:?}", peer_addr.to_string(), e);
-						}
+					if self.check_undesirable(&stream) {
+						continue;
+					}
+					if let Err(e) = self.handle_new_peer(stream) {
+						debug!("Error accepting peer {}: {:?}", peer_addr.to_string(), e);
+						let _ = self.peers.add_banned(peer_addr, ReasonForBan::BadHandshake);
 					}
 				}
 				Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
 					// nothing to do, will retry in next iteration
 				}
 				Err(e) => {
-					warn!("Couldn't establish new client connection: {:?}", e);
+					debug!("Couldn't establish new client connection: {:?}", e);
 				}
 			}
-			if self.stop.load(Ordering::Relaxed) {
+			if self.stop_state.lock().is_stopped() {
 				break;
 			}
 			thread::sleep(sleep_time);
@@ -105,13 +113,13 @@ impl Server {
 			return Err(Error::ConnectionClose);
 		}
 
-		// check ip and port to see if we are trying to connect to ourselves
-		// todo: this can't detect all cases of PeerWithSelf, for example config.host is '0.0.0.0'
-		//
-		if self.config.port == addr.port()
-			&& (addr.ip().is_loopback() || addr.ip() == self.config.host)
-		{
-			return Err(Error::PeerWithSelf);
+		if global::is_production_mode() {
+			let hs = self.handshake.clone();
+			let addrs = hs.addrs.read();
+			if addrs.contains(&addr) {
+				debug!("connect: ignore connecting to PeerWithSelf, addr: {}", addr);
+				return Err(Error::PeerWithSelf);
+			}
 		}
 
 		if let Some(p) = self.peers.get_connected_peer(addr) {
@@ -145,9 +153,12 @@ impl Server {
 				Ok(peer)
 			}
 			Err(e) => {
-				debug!(
+				trace!(
 					"connect_peer: on {}:{}. Could not connect to {}: {:?}",
-					self.config.host, self.config.port, addr, e
+					self.config.host,
+					self.config.port,
+					addr,
+					e
 				);
 				Err(Error::Connection(e))
 			}
@@ -170,11 +181,23 @@ impl Server {
 		Ok(())
 	}
 
-	fn check_banned(&self, stream: &TcpStream) -> bool {
+	/// Checks whether there's any reason we don't want to accept a peer
+	/// connection. There can be a couple of them:
+	/// 1. The peer has been previously banned and the ban period hasn't
+	/// expired yet.
+	/// 2. We're already connected to a peer at the same IP. While there are
+	/// many reasons multiple peers can legitimately share identical IP
+	/// addresses (NAT), network distribution is improved if they choose
+	/// different sets of peers themselves. In addition, it prevent potential
+	/// duplicate connections, malicious or not.
+	fn check_undesirable(&self, stream: &TcpStream) -> bool {
 		// peer has been banned, go away!
 		if let Ok(peer_addr) = stream.peer_addr() {
-			if self.peers.is_banned(peer_addr) {
-				debug!("Peer {} banned, refusing connection.", peer_addr);
+			let banned = self.peers.is_banned(peer_addr);
+			let known_ip =
+				self.peers.is_known_ip(&peer_addr) && self.config.seeding_type == Seeding::DNSSeed;
+			if banned || known_ip {
+				debug!("Peer {} banned or known, refusing connection.", peer_addr);
 				if let Err(e) = stream.shutdown(Shutdown::Both) {
 					debug!("Error shutting down conn: {:?}", e);
 				}
@@ -185,7 +208,15 @@ impl Server {
 	}
 
 	pub fn stop(&self) {
-		self.stop.store(true, Ordering::Relaxed);
+		self.stop_state.lock().stop();
+		self.peers.stop();
+	}
+
+	/// Pause means: stop all the current peers connection, only for tests.
+	/// Note:
+	/// 1. must pause the 'seed' thread also, to avoid the new egress peer connection
+	/// 2. must pause the 'p2p-server' thread also, to avoid the new ingress peer connection.
+	pub fn pause(&self) {
 		self.peers.stop();
 	}
 }
@@ -200,6 +231,10 @@ impl ChainAdapter for DummyAdapter {
 	fn total_height(&self) -> u64 {
 		0
 	}
+	fn get_transaction(&self, _h: Hash) -> Option<core::Transaction> {
+		None
+	}
+	fn tx_kernel_received(&self, _h: Hash, _addr: SocketAddr) {}
 	fn transaction_received(&self, _: core::Transaction, _stem: bool) {}
 	fn compact_block_received(&self, _cb: core::CompactBlock, _addr: SocketAddr) -> bool {
 		true
@@ -207,13 +242,13 @@ impl ChainAdapter for DummyAdapter {
 	fn header_received(&self, _bh: core::BlockHeader, _addr: SocketAddr) -> bool {
 		true
 	}
-	fn block_received(&self, _: core::Block, _: SocketAddr) -> bool {
+	fn block_received(&self, _: core::Block, _: SocketAddr, _: bool) -> bool {
 		true
 	}
-	fn headers_received(&self, _: Vec<core::BlockHeader>, _: SocketAddr) -> bool {
+	fn headers_received(&self, _: &[core::BlockHeader], _: SocketAddr) -> bool {
 		true
 	}
-	fn locate_headers(&self, _: Vec<Hash>) -> Vec<core::BlockHeader> {
+	fn locate_headers(&self, _: &[Hash]) -> Vec<core::BlockHeader> {
 		vec![]
 	}
 	fn get_block(&self, _: Hash) -> Option<core::Block> {

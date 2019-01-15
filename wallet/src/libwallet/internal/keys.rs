@@ -13,15 +13,15 @@
 // limitations under the License.
 
 //! Wallet key management functions
-use keychain::{ChildNumber, ExtKeychain, Identifier, Keychain};
-use libwallet::error::{Error, ErrorKind};
-use libwallet::types::{AcctPathMapping, WalletBackend, WalletClient};
+use crate::keychain::{ChildNumber, ExtKeychain, Identifier, Keychain};
+use crate::libwallet::error::{Error, ErrorKind};
+use crate::libwallet::types::{AcctPathMapping, NodeClient, WalletBackend};
 
 /// Get next available key in the wallet for a given parent
 pub fn next_available_key<T: ?Sized, C, K>(wallet: &mut T) -> Result<Identifier, Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	let child = wallet.next_child()?;
@@ -32,13 +32,14 @@ where
 pub fn retrieve_existing_key<T: ?Sized, C, K>(
 	wallet: &T,
 	key_id: Identifier,
+	mmr_index: Option<u64>,
 ) -> Result<(Identifier, u32), Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
-	let existing = wallet.get(&key_id)?;
+	let existing = wallet.get(&key_id, &mmr_index)?;
 	let key_id = existing.key_id.clone();
 	let derivation = existing.n_child;
 	Ok((key_id, derivation))
@@ -48,7 +49,7 @@ where
 pub fn accounts<T: ?Sized, C, K>(wallet: &mut T) -> Result<Vec<AcctPathMapping>, Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	Ok(wallet.acct_path_iter().collect())
@@ -58,7 +59,7 @@ where
 pub fn new_acct_path<T: ?Sized, C, K>(wallet: &mut T, label: &str) -> Result<Identifier, Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	let label = label.to_owned();
@@ -103,7 +104,7 @@ pub fn set_acct_path<T: ?Sized, C, K>(
 ) -> Result<(), Error>
 where
 	T: WalletBackend<C, K>,
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	let label = label.to_owned();

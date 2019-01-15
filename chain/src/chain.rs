@@ -15,38 +15,37 @@
 //! Facade and handler for the rest of the blockchain implementation
 //! and mostly the chain pipeline.
 
+use crate::core::core::hash::{Hash, Hashed, ZERO_HASH};
+use crate::core::core::merkle_proof::MerkleProof;
+use crate::core::core::verifier_cache::VerifierCache;
+use crate::core::core::{
+	Block, BlockHeader, BlockSums, Committed, Output, OutputIdentifier, Transaction, TxKernelEntry,
+};
+use crate::core::global;
+use crate::core::pow;
+use crate::error::{Error, ErrorKind};
+use crate::lmdb;
+use crate::pipe;
+use crate::store;
+use crate::txhashset;
+use crate::txhashset::TxHashSet;
+use crate::types::{
+	BlockStatus, ChainAdapter, NoStatus, Options, Tip, TxHashSetRoots, TxHashsetWriteStatus,
+};
+use crate::util::secp::pedersen::{Commitment, RangeProof};
+use crate::util::{Mutex, RwLock, StopState};
+use grin_store::Error::NotFoundErr;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use util::RwLock;
-
-use lmdb;
-use lru_cache::LruCache;
-
-use core::core::hash::{Hash, Hashed};
-use core::core::merkle_proof::MerkleProof;
-use core::core::verifier_cache::VerifierCache;
-use core::core::{Block, BlockHeader, BlockSums, Output, OutputIdentifier, Transaction, TxKernel};
-use core::global;
-use core::pow;
-use error::{Error, ErrorKind};
-use grin_store::Error::NotFoundErr;
-use pipe;
-use store;
-use txhashset;
-use types::{ChainAdapter, NoStatus, Options, Tip, TxHashSetRoots, TxHashsetWriteStatus};
-use util::secp::pedersen::{Commitment, RangeProof};
 
 /// Orphan pool size is limited by MAX_ORPHAN_SIZE
 pub const MAX_ORPHAN_SIZE: usize = 200;
 
 /// When evicting, very old orphans are evicted first
 const MAX_ORPHAN_AGE_SECS: u64 = 300;
-
-/// Number of recent hashes we keep to de-duplicate block or header sends
-const HASHES_CACHE_SIZE: usize = 200;
 
 #[derive(Debug, Clone)]
 struct Orphan {
@@ -144,20 +143,16 @@ impl OrphanBlockPool {
 pub struct Chain {
 	db_root: String,
 	store: Arc<store::ChainStore>,
-	adapter: Arc<ChainAdapter>,
+	adapter: Arc<dyn ChainAdapter + Send + Sync>,
 	orphans: Arc<OrphanBlockPool>,
 	txhashset: Arc<RwLock<txhashset::TxHashSet>>,
-	// Recently processed blocks to avoid double-processing
-	block_hashes_cache: Arc<RwLock<LruCache<Hash, bool>>>,
-	verifier_cache: Arc<RwLock<VerifierCache>>,
+	verifier_cache: Arc<RwLock<dyn VerifierCache>>,
 	// POW verification function
-	pow_verifier: fn(&BlockHeader, u8) -> Result<(), pow::Error>,
+	pow_verifier: fn(&BlockHeader) -> Result<(), pow::Error>,
 	archive_mode: bool,
+	stop_state: Arc<Mutex<StopState>>,
 	genesis: BlockHeader,
 }
-
-unsafe impl Sync for Chain {}
-unsafe impl Send for Chain {}
 
 impl Chain {
 	/// Initializes the blockchain and returns a new Chain instance. Does a
@@ -166,41 +161,101 @@ impl Chain {
 	pub fn init(
 		db_root: String,
 		db_env: Arc<lmdb::Environment>,
-		adapter: Arc<ChainAdapter>,
+		adapter: Arc<dyn ChainAdapter + Send + Sync>,
 		genesis: Block,
-		pow_verifier: fn(&BlockHeader, u8) -> Result<(), pow::Error>,
-		verifier_cache: Arc<RwLock<VerifierCache>>,
+		pow_verifier: fn(&BlockHeader) -> Result<(), pow::Error>,
+		verifier_cache: Arc<RwLock<dyn VerifierCache>>,
 		archive_mode: bool,
+		stop_state: Arc<Mutex<StopState>>,
 	) -> Result<Chain, Error> {
-		let chain_store = store::ChainStore::new(db_env)?;
+		let chain = {
+			// Note: We take a lock on the stop_state here and do not release it until
+			// we have finished chain initialization.
+			let stop_state_local = stop_state.clone();
+			let stop_lock = stop_state_local.lock();
+			if stop_lock.is_stopped() {
+				return Err(ErrorKind::Stopped.into());
+			}
 
-		let store = Arc::new(chain_store);
+			let store = Arc::new(store::ChainStore::new(db_env)?);
 
-		// open the txhashset, creating a new one if necessary
-		let mut txhashset = txhashset::TxHashSet::open(db_root.clone(), store.clone(), None)?;
+			// open the txhashset, creating a new one if necessary
+			let mut txhashset = txhashset::TxHashSet::open(db_root.clone(), store.clone(), None)?;
 
-		setup_head(genesis.clone(), store.clone(), &mut txhashset)?;
+			setup_head(&genesis, &store, &mut txhashset)?;
+			Chain::log_heads(&store)?;
 
+			Chain {
+				db_root,
+				store,
+				adapter,
+				orphans: Arc::new(OrphanBlockPool::new()),
+				txhashset: Arc::new(RwLock::new(txhashset)),
+				pow_verifier,
+				verifier_cache,
+				archive_mode,
+				stop_state,
+				genesis: genesis.header.clone(),
+			}
+		};
+
+		// Run chain compaction. Laptops and other intermittent nodes
+		// may not run long enough to trigger daily compaction.
+		// So run it explicitly here on startup (its fast enough to do so).
+		// Note: we release the stop_lock from above as compact also requires a lock.
+		chain.compact()?;
+
+		Ok(chain)
+	}
+
+	/// Return our shared txhashset instance.
+	pub fn txhashset(&self) -> Arc<RwLock<TxHashSet>> {
+		self.txhashset.clone()
+	}
+
+	/// Shared store instance.
+	pub fn store(&self) -> Arc<store::ChainStore> {
+		self.store.clone()
+	}
+
+	fn log_heads(store: &store::ChainStore) -> Result<(), Error> {
 		let head = store.head()?;
 		debug!(
-			"Chain init: {} @ {} [{}]",
+			"init: head: {} @ {} [{}]",
 			head.total_difficulty.to_num(),
 			head.height,
 			head.last_block_h,
 		);
 
-		Ok(Chain {
-			db_root: db_root,
-			store: store,
-			adapter: adapter,
-			orphans: Arc::new(OrphanBlockPool::new()),
-			txhashset: Arc::new(RwLock::new(txhashset)),
-			pow_verifier,
-			verifier_cache,
-			block_hashes_cache: Arc::new(RwLock::new(LruCache::new(HASHES_CACHE_SIZE))),
-			archive_mode,
-			genesis: genesis.header.clone(),
-		})
+		let header_head = store.header_head()?;
+		debug!(
+			"init: header_head: {} @ {} [{}]",
+			header_head.total_difficulty.to_num(),
+			header_head.height,
+			header_head.last_block_h,
+		);
+
+		let sync_head = store.get_sync_head()?;
+		debug!(
+			"init: sync_head: {} @ {} [{}]",
+			sync_head.total_difficulty.to_num(),
+			sync_head.height,
+			sync_head.last_block_h,
+		);
+
+		Ok(())
+	}
+
+	/// Reset sync_head to current header_head.
+	/// We do this when we first transition to header_sync to ensure we extend
+	/// the "sync" header MMR from a known consistent state and to ensure we track
+	/// the header chain correctly at the fork point.
+	pub fn reset_sync_head(&self) -> Result<Tip, Error> {
+		let batch = self.store.batch()?;
+		batch.reset_sync_head()?;
+		let head = batch.get_sync_head()?;
+		batch.commit()?;
+		Ok(head)
 	}
 
 	/// Processes a single block, then checks for orphans, processing
@@ -214,36 +269,64 @@ impl Chain {
 		res
 	}
 
+	fn determine_status(&self, head: Option<Tip>, prev_head: Tip) -> BlockStatus {
+		// We have more work if the chain head is updated.
+		let is_more_work = head.is_some();
+
+		let mut is_next_block = false;
+		if let Some(head) = head {
+			if head.prev_block_h == prev_head.last_block_h {
+				is_next_block = true;
+			}
+		}
+
+		match (is_more_work, is_next_block) {
+			(true, true) => BlockStatus::Next,
+			(true, false) => BlockStatus::Reorg,
+			(false, _) => BlockStatus::Fork,
+		}
+	}
+
 	/// Attempt to add a new block to the chain.
 	/// Returns true if it has been added to the longest chain
 	/// or false if it has added to a fork (or orphan?).
 	fn process_block_single(&self, b: Block, opts: Options) -> Result<Option<Tip>, Error> {
-		let maybe_new_head: Result<Option<Tip>, Error>;
-		{
+		let (maybe_new_head, prev_head) = {
+			// Note: We take a lock on the stop_state here and do not release it until
+			// we have finished processing this single block.
+			// We take care to write both the txhashset *and* the batch while we
+			// have the stop_state lock.
+			let stop_lock = self.stop_state.lock();
+			if stop_lock.is_stopped() {
+				return Err(ErrorKind::Stopped.into());
+			}
+
 			let mut txhashset = self.txhashset.write();
 			let batch = self.store.batch()?;
 			let mut ctx = self.new_ctx(opts, batch, &mut txhashset)?;
 
-			maybe_new_head = pipe::process_block(&b, &mut ctx);
+			let prev_head = ctx.batch.head()?;
+
+			let maybe_new_head = pipe::process_block(&b, &mut ctx);
+
+			// We have flushed txhashset extension changes to disk
+			// but not yet committed the batch.
+			// A node shutdown at this point can be catastrophic...
+			// We prevent this via the stop_lock (see above).
 			if let Ok(_) = maybe_new_head {
 				ctx.batch.commit()?;
 			}
-			// release the lock and let the batch go before post-processing
-		}
 
-		let add_to_hash_cache = |hash: Hash| {
-			// only add to hash cache below if block is definitively accepted
-			// or rejected
-			let mut cache = self.block_hashes_cache.write();
-			cache.insert(hash, true);
+			// release the lock and let the batch go before post-processing
+			(maybe_new_head, prev_head)
 		};
 
 		match maybe_new_head {
 			Ok(head) => {
-				add_to_hash_cache(b.hash());
+				let status = self.determine_status(head.clone(), prev_head);
 
 				// notifying other parts of the system of the update
-				self.adapter.block_accepted(&b, opts);
+				self.adapter.block_accepted(&b, status, opts);
 
 				Ok(head)
 			}
@@ -286,7 +369,6 @@ impl Chain {
 						b.header.height,
 						e
 					);
-					add_to_hash_cache(b.hash());
 					Err(ErrorKind::Other(format!("{:?}", e).to_owned()).into())
 				}
 			},
@@ -295,22 +377,28 @@ impl Chain {
 
 	/// Process a block header received during "header first" propagation.
 	pub fn process_block_header(&self, bh: &BlockHeader, opts: Options) -> Result<(), Error> {
+		// We take a write lock on the txhashset and create a new batch
+		// but this is strictly readonly so we do not commit the batch.
 		let mut txhashset = self.txhashset.write();
 		let batch = self.store.batch()?;
 		let mut ctx = self.new_ctx(opts, batch, &mut txhashset)?;
 		pipe::process_block_header(bh, &mut ctx)?;
-		ctx.batch.commit()?;
 		Ok(())
 	}
 
 	/// Attempt to add new headers to the header chain (or fork).
 	/// This is only ever used during sync and is based on sync_head.
 	/// We update header_head here if our total work increases.
-	pub fn sync_block_headers(
-		&self,
-		headers: &Vec<BlockHeader>,
-		opts: Options,
-	) -> Result<(), Error> {
+	pub fn sync_block_headers(&self, headers: &[BlockHeader], opts: Options) -> Result<(), Error> {
+		// Note: We take a lock on the stop_state here and do not release it until
+		// we have finished processing this single block.
+		// We take care to write both the txhashset *and* the batch while we
+		// have the stop_state lock.
+		let stop_lock = self.stop_state.lock();
+		if stop_lock.is_stopped() {
+			return Err(ErrorKind::Stopped.into());
+		}
+
 		let mut txhashset = self.txhashset.write();
 		let batch = self.store.batch()?;
 		let mut ctx = self.new_ctx(opts, batch, &mut txhashset)?;
@@ -330,7 +418,6 @@ impl Chain {
 		Ok(pipe::BlockContext {
 			opts,
 			pow_verifier: self.pow_verifier,
-			block_hashes_cache: self.block_hashes_cache.clone(),
 			verifier_cache: self.verifier_cache.clone(),
 			txhashset,
 			batch,
@@ -410,7 +497,7 @@ impl Chain {
 	/// current chain state, specifically the current winning (valid, most
 	/// work) fork.
 	pub fn is_unspent(&self, output_ref: &OutputIdentifier) -> Result<Hash, Error> {
-		let mut txhashset = self.txhashset.write();
+		let txhashset = self.txhashset.read();
 		let res = txhashset.is_unspent(output_ref);
 		match res {
 			Err(e) => Err(e),
@@ -436,9 +523,9 @@ impl Chain {
 	/// that has not yet sufficiently matured.
 	pub fn verify_coinbase_maturity(&self, tx: &Transaction) -> Result<(), Error> {
 		let height = self.next_block_height()?;
-		let mut txhashset = self.txhashset.write();
-		txhashset::extending_readonly(&mut txhashset, |extension| {
-			extension.verify_coinbase_maturity(&tx.inputs(), height)?;
+		let txhashset = self.txhashset.read();
+		txhashset::utxo_view(&txhashset, |utxo| {
+			utxo.verify_coinbase_maturity(&tx.inputs(), height)?;
 			Ok(())
 		})
 	}
@@ -475,15 +562,23 @@ impl Chain {
 		})
 	}
 
-	/// Sets the txhashset roots on a brand new block by applying the block on
-	/// the current txhashset state.
-	pub fn set_txhashset_roots(&self, b: &mut Block, is_fork: bool) -> Result<(), Error> {
+	/// *** Only used in tests. ***
+	/// Convenience for setting roots on a block header when
+	/// creating a chain fork during tests.
+	pub fn set_txhashset_roots_forked(
+		&self,
+		b: &mut Block,
+		prev: &BlockHeader,
+	) -> Result<(), Error> {
+		let prev_block = self.get_block(&prev.hash())?;
 		let mut txhashset = self.txhashset.write();
 		let (prev_root, roots, sizes) =
 			txhashset::extending_readonly(&mut txhashset, |extension| {
-				if is_fork {
-					pipe::rewind_and_apply_fork(b, extension)?;
-				}
+				// Put the txhashset in the correct state as of the previous block.
+				// We cannot use the new block to do this because we have no
+				// explicit previous linkage (and prev_root not yet setup).
+				pipe::rewind_and_apply_fork(&prev_block, extension)?;
+				extension.apply_block(&prev_block)?;
 
 				// Retrieve the header root before we apply the new block
 				let prev_root = extension.header_root();
@@ -513,7 +608,41 @@ impl Chain {
 		Ok(())
 	}
 
-	/// Return a pre-built Merkle proof for the given commitment from the store.
+	/// Sets the txhashset roots on a brand new block by applying the block on
+	/// the current txhashset state.
+	pub fn set_txhashset_roots(&self, b: &mut Block) -> Result<(), Error> {
+		let mut txhashset = self.txhashset.write();
+		let (prev_root, roots, sizes) =
+			txhashset::extending_readonly(&mut txhashset, |extension| {
+				// Retrieve the header root before we apply the new block
+				let prev_root = extension.header_root();
+
+				// Apply the latest block to the chain state via the extension.
+				extension.apply_block(b)?;
+
+				Ok((prev_root, extension.roots(), extension.sizes()))
+			})?;
+
+		// Set the prev_root on the header.
+		b.header.prev_root = prev_root;
+
+		// Set the output, rangeproof and kernel MMR roots.
+		b.header.output_root = roots.output_root;
+		b.header.range_proof_root = roots.rproof_root;
+		b.header.kernel_root = roots.kernel_root;
+
+		// Set the output and kernel MMR sizes.
+		{
+			// Carefully destructure these correctly...
+			let (_, output_mmr_size, _, kernel_mmr_size) = sizes;
+			b.header.output_mmr_size = output_mmr_size;
+			b.header.kernel_mmr_size = kernel_mmr_size;
+		}
+
+		Ok(())
+	}
+
+	/// Return a Merkle proof for the given commitment from the store.
 	pub fn get_merkle_proof(
 		&self,
 		output: &OutputIdentifier,
@@ -536,10 +665,9 @@ impl Chain {
 		txhashset.merkle_proof(commit)
 	}
 
-	/// Returns current txhashset roots
+	/// Returns current txhashset roots.
 	pub fn get_txhashset_roots(&self) -> TxHashSetRoots {
-		let mut txhashset = self.txhashset.write();
-		txhashset.roots()
+		self.txhashset.read().roots()
 	}
 
 	/// Provides a reading view into the current txhashset state as well as
@@ -562,7 +690,7 @@ impl Chain {
 		}
 
 		// prepares the zip and return the corresponding Read
-		let txhashset_reader = txhashset::zip_read(self.db_root.clone(), &header)?;
+		let txhashset_reader = txhashset::zip_read(self.db_root.clone(), &header, None)?;
 		Ok((
 			header.output_mmr_size,
 			header.kernel_mmr_size,
@@ -580,9 +708,7 @@ impl Chain {
 		header: &BlockHeader,
 		txhashset: &txhashset::TxHashSet,
 	) -> Result<(), Error> {
-		debug!(
-			"chain: validate_kernel_history: rewinding and validating kernel history (readonly)"
-		);
+		debug!("validate_kernel_history: rewinding and validating kernel history (readonly)");
 
 		let mut count = 0;
 		let mut current = header.clone();
@@ -590,14 +716,14 @@ impl Chain {
 			while current.height > 0 {
 				view.rewind(&current)?;
 				view.validate_root()?;
-				current = view.batch().get_block_header(&current.previous)?;
+				current = view.batch().get_previous_header(&current)?;
 				count += 1;
 			}
 			Ok(())
 		})?;
 
 		debug!(
-			"chain: validate_kernel_history: validated kernel root on {} headers",
+			"validate_kernel_history: validated kernel root on {} headers",
 			count,
 		);
 
@@ -638,6 +764,79 @@ impl Chain {
 		Ok(())
 	}
 
+	/// Check chain status whether a txhashset downloading is needed
+	pub fn check_txhashset_needed(&self, caller: String, hashes: &mut Option<Vec<Hash>>) -> bool {
+		let horizon = global::cut_through_horizon() as u64;
+		let body_head = self.head().unwrap();
+		let header_head = self.header_head().unwrap();
+		let sync_head = self.get_sync_head().unwrap();
+
+		debug!(
+			"{}: body_head - {}, {}, header_head - {}, {}, sync_head - {}, {}",
+			caller,
+			body_head.last_block_h,
+			body_head.height,
+			header_head.last_block_h,
+			header_head.height,
+			sync_head.last_block_h,
+			sync_head.height,
+		);
+
+		if body_head.total_difficulty >= header_head.total_difficulty {
+			debug!(
+				"{}: no need txhashset. header_head.total_difficulty: {} <= body_head.total_difficulty: {}",
+				caller, header_head.total_difficulty, body_head.total_difficulty,
+			);
+			return false;
+		}
+
+		let mut oldest_height = 0;
+		let mut oldest_hash = ZERO_HASH;
+
+		let mut current = self.get_block_header(&header_head.last_block_h);
+		if current.is_err() {
+			error!(
+				"{}: header_head not found in chain db: {} at {}",
+				caller, header_head.last_block_h, header_head.height,
+			);
+		}
+
+		//
+		// TODO - Investigate finding the "common header" by comparing header_mmr and
+		// sync_mmr (bytes will be identical up to the common header).
+		//
+		while let Ok(header) = current {
+			// break out of the while loop when we find a header common
+			// between the header chain and the current body chain
+			if header.height <= body_head.height {
+				if let Ok(_) = self.is_on_current_chain(&header) {
+					break;
+				}
+			}
+
+			oldest_height = header.height;
+			oldest_hash = header.hash();
+			if let Some(hs) = hashes {
+				hs.push(oldest_hash);
+			}
+			current = self.get_previous_header(&header);
+		}
+
+		if oldest_height < header_head.height.saturating_sub(horizon) {
+			if oldest_height > 0 {
+				debug!(
+					"{}: need a state sync for txhashset. oldest block which is not on local chain: {} at {}",
+					caller, oldest_hash, oldest_height,
+				);
+				return true;
+			} else {
+				error!("{}: something is wrong! oldest_height is 0", caller);
+				return false;
+			};
+		}
+		return false;
+	}
+
 	/// Writes a reading view on a txhashset state that's been provided to us.
 	/// If we're willing to accept that new state, the data stream will be
 	/// read as a zip file, unzipped and the resulting state files should be
@@ -646,17 +845,15 @@ impl Chain {
 		&self,
 		h: Hash,
 		txhashset_data: File,
-		status: &TxHashsetWriteStatus,
+		status: &dyn TxHashsetWriteStatus,
 	) -> Result<(), Error> {
 		status.on_setup();
 
-		// Initial check based on relative heights of current head and header_head.
-		{
-			let head = self.head().unwrap();
-			let header_head = self.header_head().unwrap();
-			if header_head.height - head.height < global::cut_through_horizon() as u64 {
-				return Err(ErrorKind::InvalidTxHashSet("not needed".to_owned()).into());
-			}
+		// Initial check whether this txhashset is needed or not
+		let mut hashes: Option<Vec<Hash>> = None;
+		if !self.check_txhashset_needed("txhashset_write".to_owned(), &mut hashes) {
+			warn!("txhashset_write: txhashset received but it's not needed! ignored.");
+			return Err(ErrorKind::InvalidTxHashSet("not needed".to_owned()).into());
 		}
 
 		let header = self.get_block_header(&h)?;
@@ -667,13 +864,13 @@ impl Chain {
 
 		// The txhashset.zip contains the output, rangeproof and kernel MMRs.
 		// We must rebuild the header MMR ourselves based on the headers in our db.
-		self.rebuild_header_mmr(&Tip::from_block(&header), &mut txhashset)?;
+		self.rebuild_header_mmr(&Tip::from_header(&header), &mut txhashset)?;
 
 		// Validate the full kernel history (kernel MMR root for every block header).
 		self.validate_kernel_history(&header, &txhashset)?;
 
 		// all good, prepare a new batch and update all the required records
-		debug!("chain: txhashset_write: rewinding a 2nd time (writeable)");
+		debug!("txhashset_write: rewinding a 2nd time (writeable)");
 
 		let mut batch = self.store.batch()?;
 
@@ -697,22 +894,23 @@ impl Chain {
 			Ok(())
 		})?;
 
-		debug!("chain: txhashset_write: finished validating and rebuilding");
+		debug!("txhashset_write: finished validating and rebuilding");
 
 		status.on_save();
 
 		// Save the new head to the db and rebuild the header by height index.
 		{
-			let tip = Tip::from_block(&header);
+			let tip = Tip::from_header(&header);
 			batch.save_body_head(&tip)?;
-			batch.save_header_height(&header)?;
-			batch.build_by_height_index(&header, true)?;
+
+			// Reset the body tail to the body head after a txhashset write
+			batch.save_body_tail(&tip)?;
 		}
 
 		// Commit all the changes to the db.
 		batch.commit()?;
 
-		debug!("chain: txhashset_write: finished committing the batch (head etc.)");
+		debug!("txhashset_write: finished committing the batch (head etc.)");
 
 		// Replace the chain txhashset with the newly built one.
 		{
@@ -720,7 +918,7 @@ impl Chain {
 			*txhashset_ref = txhashset;
 		}
 
-		debug!("chain: txhashset_write: replaced our txhashset with the new one");
+		debug!("txhashset_write: replaced our txhashset with the new one");
 
 		// Check for any orphan blocks and process them based on the new chain state.
 		self.check_orphans(header.height + 1);
@@ -730,20 +928,19 @@ impl Chain {
 	}
 
 	fn compact_txhashset(&self) -> Result<(), Error> {
-		debug!("Starting blockchain compaction.");
+		debug!("Starting txhashset compaction...");
 		{
+			// Note: We take a lock on the stop_state here and do not release it until
+			// we have finished processing this chain compaction operation.
+			let stop_lock = self.stop_state.lock();
+			if stop_lock.is_stopped() {
+				return Err(ErrorKind::Stopped.into());
+			}
+
 			let mut txhashset = self.txhashset.write();
 			txhashset.compact()?;
-			txhashset::extending_readonly(&mut txhashset, |extension| {
-				extension.dump_output_pmmr();
-				Ok(())
-			})?;
 		}
-
-		// Now check we can still successfully validate the chain state after
-		// compacting, shouldn't be necessary once all of this is well-oiled
-		debug!("Validating state after compaction.");
-		self.validate(true)?;
+		debug!("... finished txhashset compaction.");
 		Ok(())
 	}
 
@@ -758,11 +955,16 @@ impl Chain {
 		let horizon = global::cut_through_horizon() as u64;
 		let head = self.head()?;
 
+		let tail = match self.tail() {
+			Ok(tail) => tail,
+			Err(_) => Tip::from_header(&self.genesis),
+		};
+
 		let cutoff = head.height.saturating_sub(horizon);
 
 		debug!(
-			"chain: compact_blocks_db: head height: {}, horizon: {}, cutoff: {}",
-			head.height, horizon, cutoff,
+			"compact_blocks_db: head height: {}, tail height: {}, horizon: {}, cutoff: {}",
+			head.height, tail.height, horizon, cutoff,
 		);
 
 		if cutoff == 0 {
@@ -770,8 +972,11 @@ impl Chain {
 		}
 
 		let mut count = 0;
+
+		let tail = self.get_header_by_height(head.height - horizon)?;
+		let mut current = self.get_header_by_height(head.height - horizon - 1)?;
+
 		let batch = self.store.batch()?;
-		let mut current = batch.get_header_by_height(head.height - horizon - 1)?;
 		loop {
 			// Go to the store directly so we can handle NotFoundErr robustly.
 			match self.store.get_block(&current.hash()) {
@@ -791,14 +996,18 @@ impl Chain {
 			if current.height <= 1 {
 				break;
 			}
-			match batch.get_block_header(&current.previous) {
+			match batch.get_previous_header(&current) {
 				Ok(h) => current = h,
 				Err(NotFoundErr(_)) => break,
 				Err(e) => return Err(From::from(e)),
 			}
 		}
+		batch.save_body_tail(&Tip::from_header(&tail))?;
 		batch.commit()?;
-		debug!("chain: compact_blocks_db: removed {} blocks.", count);
+		debug!(
+			"compact_blocks_db: removed {} blocks. tail height: {}",
+			count, tail.height
+		);
 		Ok(())
 	}
 
@@ -819,20 +1028,22 @@ impl Chain {
 
 	/// returns the last n nodes inserted into the output sum tree
 	pub fn get_last_n_output(&self, distance: u64) -> Vec<(Hash, OutputIdentifier)> {
-		let mut txhashset = self.txhashset.write();
-		txhashset.last_n_output(distance)
+		self.txhashset.read().last_n_output(distance)
 	}
 
 	/// as above, for rangeproofs
 	pub fn get_last_n_rangeproof(&self, distance: u64) -> Vec<(Hash, RangeProof)> {
-		let mut txhashset = self.txhashset.write();
-		txhashset.last_n_rangeproof(distance)
+		self.txhashset.read().last_n_rangeproof(distance)
 	}
 
 	/// as above, for kernels
-	pub fn get_last_n_kernel(&self, distance: u64) -> Vec<(Hash, TxKernel)> {
-		let mut txhashset = self.txhashset.write();
-		txhashset.last_n_kernel(distance)
+	pub fn get_last_n_kernel(&self, distance: u64) -> Vec<(Hash, TxKernelEntry)> {
+		self.txhashset.read().last_n_kernel(distance)
+	}
+
+	/// as above, for kernels
+	pub fn get_output_pos(&self, commit: &Commitment) -> Result<u64, Error> {
+		Ok(self.txhashset.read().get_output_pos(commit)?)
 	}
 
 	/// outputs by insertion index
@@ -841,14 +1052,15 @@ impl Chain {
 		start_index: u64,
 		max: u64,
 	) -> Result<(u64, u64, Vec<Output>), Error> {
-		let mut txhashset = self.txhashset.write();
+		let txhashset = self.txhashset.read();
 		let max_index = txhashset.highest_output_insertion_index();
 		let outputs = txhashset.outputs_by_insertion_index(start_index, max);
 		let rangeproofs = txhashset.rangeproofs_by_insertion_index(start_index, max);
 		if outputs.0 != rangeproofs.0 || outputs.1.len() != rangeproofs.1.len() {
 			return Err(ErrorKind::TxHashSetErr(String::from(
 				"Output and rangeproof sets don't match",
-			)).into());
+			))
+			.into());
 		}
 		let mut output_vec: Vec<Output> = vec![];
 		for (ref x, &y) in outputs.1.iter().zip(rangeproofs.1.iter()) {
@@ -866,19 +1078,18 @@ impl Chain {
 		self.orphans.len()
 	}
 
-	/// Reset header_head and sync_head to head of current body chain
-	pub fn reset_head(&self) -> Result<(), Error> {
-		let batch = self.store.batch()?;
-		batch.reset_head()?;
-		batch.commit()?;
-		Ok(())
-	}
-
 	/// Tip (head) of the block chain.
 	pub fn head(&self) -> Result<Tip, Error> {
 		self.store
 			.head()
 			.map_err(|e| ErrorKind::StoreErr(e, "chain head".to_owned()).into())
+	}
+
+	/// Tail of the block chain in this node after compact (cross-block cut-through)
+	pub fn tail(&self) -> Result<Tip, Error> {
+		self.store
+			.tail()
+			.map_err(|e| ErrorKind::StoreErr(e, "chain tail".to_owned()).into())
 	}
 
 	/// Tip (head) of the header chain.
@@ -909,6 +1120,13 @@ impl Chain {
 			.map_err(|e| ErrorKind::StoreErr(e, "chain get header".to_owned()).into())
 	}
 
+	/// Get previous block header.
+	pub fn get_previous_header(&self, header: &BlockHeader) -> Result<BlockHeader, Error> {
+		self.store
+			.get_previous_header(header)
+			.map_err(|e| ErrorKind::StoreErr(e, "chain get previous header".to_owned()).into())
+	}
+
 	/// Get block_sums by header hash.
 	pub fn get_block_sums(&self, h: &Hash) -> Result<BlockSums, Error> {
 		self.store
@@ -916,30 +1134,37 @@ impl Chain {
 			.map_err(|e| ErrorKind::StoreErr(e, "chain get block_sums".to_owned()).into())
 	}
 
-	/// Gets the block header at the provided height
+	/// Gets the block header at the provided height.
+	/// Note: This takes a read lock on the txhashset.
+	/// Take care not to call this repeatedly in a tight loop.
 	pub fn get_header_by_height(&self, height: u64) -> Result<BlockHeader, Error> {
-		self.store
-			.get_header_by_height(height)
-			.map_err(|e| ErrorKind::StoreErr(e, "chain get header by height".to_owned()).into())
+		let txhashset = self.txhashset.read();
+		let header = txhashset.get_header_by_height(height)?;
+		Ok(header)
 	}
 
-	/// Gets the block header in which a given output appears in the txhashset
+	/// Gets the block header in which a given output appears in the txhashset.
 	pub fn get_header_for_output(
 		&self,
 		output_ref: &OutputIdentifier,
 	) -> Result<BlockHeader, Error> {
-		let mut txhashset = self.txhashset.write();
+		let txhashset = self.txhashset.read();
+
 		let (_, pos) = txhashset.is_unspent(output_ref)?;
-		let mut min = 1;
+
+		let mut min = 0;
 		let mut max = {
-			let h = self.head()?;
-			h.height
+			let head = self.head()?;
+			head.height
 		};
 
 		loop {
 			let search_height = max - (max - min) / 2;
-			let h = self.get_header_by_height(search_height)?;
-			let h_prev = self.get_header_by_height(search_height - 1)?;
+			let h = txhashset.get_header_by_height(search_height)?;
+			if search_height == 0 {
+				return Ok(h);
+			}
+			let h_prev = txhashset.get_header_by_height(search_height - 1)?;
 			if pos > h.output_mmr_size {
 				min = search_height;
 			} else if pos < h_prev.output_mmr_size {
@@ -957,9 +1182,12 @@ impl Chain {
 	/// Checks the header_by_height index to verify the header is where we say
 	/// it is
 	pub fn is_on_current_chain(&self, header: &BlockHeader) -> Result<(), Error> {
-		self.store
-			.is_on_current_chain(header)
-			.map_err(|e| ErrorKind::StoreErr(e, "chain is_on_current_chain".to_owned()).into())
+		let chain_header = self.get_header_by_height(header.height)?;
+		if chain_header.hash() == header.hash() {
+			Ok(())
+		} else {
+			Err(ErrorKind::Other(format!("not on current chain")).into())
+		}
 	}
 
 	/// Get the tip of the current "sync" header chain.
@@ -973,7 +1201,7 @@ impl Chain {
 	/// Builds an iterator on blocks starting from the current chain head and
 	/// running backward. Specialized to return information pertaining to block
 	/// difficulty calculation (timestamp and previous difficulties).
-	pub fn difficulty_iter(&self) -> store::DifficultyIter {
+	pub fn difficulty_iter(&self) -> store::DifficultyIter<'_> {
 		let head = self.head().unwrap();
 		let store = self.store.clone();
 		store::DifficultyIter::from(head.last_block_h, store)
@@ -985,19 +1213,11 @@ impl Chain {
 			.block_exists(&h)
 			.map_err(|e| ErrorKind::StoreErr(e, "chain block exists".to_owned()).into())
 	}
-
-	/// Reset sync_head to the provided head.
-	pub fn reset_sync_head(&self, head: &Tip) -> Result<(), Error> {
-		let batch = self.store.batch()?;
-		batch.save_sync_head(head)?;
-		batch.commit()?;
-		Ok(())
-	}
 }
 
 fn setup_head(
-	genesis: Block,
-	store: Arc<store::ChainStore>,
+	genesis: &Block,
+	store: &store::ChainStore,
 	txhashset: &mut txhashset::TxHashSet,
 ) -> Result<(), Error> {
 	let mut batch = store.batch()?;
@@ -1018,9 +1238,15 @@ fn setup_head(
 				// If we have no header MMR then rebuild as necessary.
 				// Supports old nodes with no header MMR.
 				txhashset::header_extending(txhashset, &mut batch, |extension| {
-					if extension.size() == 0 {
+					let needs_rebuild = match extension.get_header_by_height(head.height) {
+						Ok(header) => header.hash() != head.last_block_h,
+						Err(_) => true,
+					};
+
+					if needs_rebuild {
 						extension.rebuild(&head, &genesis.header)?;
 					}
+
 					Ok(())
 				})?;
 
@@ -1034,7 +1260,7 @@ fn setup_head(
 					if header.height > 0 && extension.batch.get_block_sums(&header.hash()).is_err()
 					{
 						debug!(
-							"chain: init: building (missing) block sums for {} @ {}",
+							"init: building (missing) block sums for {} @ {}",
 							header.height,
 							header.hash()
 						);
@@ -1054,7 +1280,7 @@ fn setup_head(
 					}
 
 					debug!(
-						"chain: init: rewinding and validating before we start... {} at {}",
+						"init: rewinding and validating before we start... {} at {}",
 						header.hash(),
 						header.height,
 					);
@@ -1069,34 +1295,68 @@ fn setup_head(
 					// header and try again
 					let prev_header = batch.get_block_header(&head.prev_block_h)?;
 					let _ = batch.delete_block(&header.hash());
-					let _ = batch.setup_height(&prev_header, &head)?;
-					head = Tip::from_block(&prev_header);
+					head = Tip::from_header(&prev_header);
 					batch.save_head(&head)?;
 				}
 			}
 		}
 		Err(NotFoundErr(_)) => {
-			batch.save_block(&genesis)?;
-			let tip = Tip::from_block(&genesis.header);
-			batch.save_head(&tip)?;
-			batch.setup_height(&genesis.header, &tip)?;
+			let mut sums = BlockSums::default();
 
-			// Apply the genesis block to our empty MMRs.
+			// Save the genesis header with a "zero" header_root.
+			// We will update this later once we have the correct header_root.
+			batch.save_block_header(&genesis.header)?;
+			batch.save_block(&genesis)?;
+
+			let tip = Tip::from_header(&genesis.header);
+			batch.save_head(&tip)?;
+
+			if genesis.kernels().len() > 0 {
+				let (utxo_sum, kernel_sum) = (sums, genesis as &Committed).verify_kernel_sums(
+					genesis.header.overage(),
+					genesis.header.total_kernel_offset(),
+				)?;
+				sums = BlockSums {
+					utxo_sum,
+					kernel_sum,
+				};
+			}
 			txhashset::extending(txhashset, &mut batch, |extension| {
 				extension.apply_block(&genesis)?;
+				extension.validate_roots()?;
+				extension.validate_sizes()?;
 				Ok(())
 			})?;
 
 			// Save the block_sums to the db for use later.
-			batch.save_block_sums(&genesis.hash(), &BlockSums::default())?;
+			batch.save_block_sums(&genesis.hash(), &sums)?;
 
-			info!("chain: init: saved genesis: {:?}", genesis.hash());
+			info!("init: saved genesis: {:?}", genesis.hash());
 		}
 		Err(e) => return Err(ErrorKind::StoreErr(e, "chain init load head".to_owned()))?,
 	};
 
-	// Reset sync_head to be consistent with current header_head.
-	batch.reset_sync_head()?;
+	// Check we have the header corresponding to the header_head.
+	// If not then something is corrupted and we should reset our header_head.
+	// Either way we want to reset sync_head to match header_head.
+	let head = batch.head()?;
+	let header_head = batch.header_head()?;
+	if batch.get_block_header(&header_head.last_block_h).is_ok() {
+		// Reset sync_head to be consistent with current header_head.
+		batch.reset_sync_head()?;
+	} else {
+		// Reset both header_head and sync_head to be consistent with current head.
+		warn!(
+			"setup_head: header missing for {}, {}, resetting header_head and sync_head to head: {}, {}",
+			header_head.last_block_h,
+			header_head.height,
+			head.last_block_h,
+			head.height,
+		);
+		batch.reset_header_head()?;
+		batch.reset_sync_head()?;
+	}
+
 	batch.commit()?;
 
 	Ok(())

@@ -13,19 +13,19 @@
 // limitations under the License.
 
 //! Server types
+use crate::util::RwLock;
 use std::convert::From;
 use std::sync::Arc;
-use util::RwLock;
 
-use api;
-use chain;
+use crate::api;
+use crate::chain;
+use crate::core::global::ChainTypes;
+use crate::core::{core, pow};
+use crate::p2p;
+use crate::pool;
+use crate::store;
+use crate::wallet;
 use chrono::prelude::{DateTime, Utc};
-use core::global::ChainTypes;
-use core::{core, pow};
-use p2p;
-use pool;
-use store;
-use wallet;
 
 /// Error type wrapping underlying module errors.
 #[derive(Debug)]
@@ -46,6 +46,8 @@ pub enum Error {
 	Cuckoo(pow::Error),
 	/// Error originating from the transaction pool.
 	Pool(pool::PoolError),
+	/// Invalid Arguments.
+	ArgumentError(String),
 }
 
 impl From<core::block::Error> for Error {
@@ -124,6 +126,11 @@ pub struct ServerConfig {
 	/// Location of secret for basic auth on Rest API HTTP server.
 	pub api_secret_path: Option<String>,
 
+	/// TLS certificate file
+	pub tls_certificate_file: Option<String>,
+	/// TLS certificate private key file
+	pub tls_certificate_key: Option<String>,
+
 	/// Setup the server for tests, testnet or mainnet
 	#[serde(default)]
 	pub chain_type: ChainTypes,
@@ -172,8 +179,10 @@ impl Default for ServerConfig {
 	fn default() -> ServerConfig {
 		ServerConfig {
 			db_root: "grin_chain".to_string(),
-			api_http_addr: "127.0.0.1:13413".to_string(),
+			api_http_addr: "127.0.0.1:3413".to_string(),
 			api_secret_path: Some(".api_secret".to_string()),
+			tls_certificate_file: None,
+			tls_certificate_key: None,
 			p2p_config: p2p::P2PConfig::default(),
 			dandelion_config: pool::DandelionConfig::default(),
 			stratum_mining_config: Some(StratumServerConfig::default()),
@@ -218,12 +227,12 @@ pub struct StratumServerConfig {
 impl Default for StratumServerConfig {
 	fn default() -> StratumServerConfig {
 		StratumServerConfig {
-			wallet_listener_url: "http://127.0.0.1:13415".to_string(),
+			wallet_listener_url: "http://127.0.0.1:3415".to_string(),
 			burn_reward: false,
 			attempt_time_per_block: 15,
 			minimum_share_difficulty: 1,
 			enable_stratum_server: Some(false),
-			stratum_server_addr: Some("127.0.0.1:13416".to_string()),
+			stratum_server_addr: Some("127.0.0.1:3416".to_string()),
 		}
 	}
 }
@@ -261,6 +270,8 @@ pub enum SyncStatus {
 	},
 	/// Finalizing the new state
 	TxHashsetSave,
+	/// State sync finalized
+	TxHashsetDone,
 	/// Downloading blocks
 	BodySync {
 		current_height: u64,
@@ -383,9 +394,6 @@ impl chain::TxHashsetWriteStatus for SyncState {
 	}
 
 	fn on_done(&self) {
-		self.update(SyncStatus::BodySync {
-			current_height: 0,
-			highest_height: 0,
-		});
+		self.update(SyncStatus::TxHashsetDone);
 	}
 }

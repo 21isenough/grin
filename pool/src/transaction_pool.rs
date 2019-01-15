@@ -17,21 +17,20 @@
 //! resulting tx pool can be added to the current chain state to produce a
 //! valid chain state.
 
+use self::core::core::hash::{Hash, Hashed};
+use self::core::core::id::ShortId;
+use self::core::core::verifier_cache::VerifierCache;
+use self::core::core::{transaction, Block, BlockHeader, Transaction};
+use self::util::RwLock;
+use crate::pool::Pool;
+use crate::types::{
+	BlockChain, PoolAdapter, PoolConfig, PoolEntry, PoolEntryState, PoolError, TxSource,
+};
+use chrono::prelude::*;
+use grin_core as core;
+use grin_util as util;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use util::RwLock;
-
-use chrono::prelude::Utc;
-
-use core::core::hash::{Hash, Hashed};
-use core::core::id::ShortId;
-use core::core::verifier_cache::VerifierCache;
-use core::core::{transaction, Block, BlockHeader, Transaction};
-use pool::Pool;
-use types::{BlockChain, PoolAdapter, PoolConfig, PoolEntry, PoolEntryState, PoolError, TxSource};
-
-// Cache this many txs to handle a potential fork and re-org.
-const REORG_CACHE_SIZE: usize = 100;
 
 /// Transaction pool implementation.
 pub struct TransactionPool {
@@ -44,19 +43,19 @@ pub struct TransactionPool {
 	/// Cache of previous txs in case of a re-org.
 	pub reorg_cache: Arc<RwLock<VecDeque<PoolEntry>>>,
 	/// The blockchain
-	pub blockchain: Arc<BlockChain>,
-	pub verifier_cache: Arc<RwLock<VerifierCache>>,
+	pub blockchain: Arc<dyn BlockChain>,
+	pub verifier_cache: Arc<RwLock<dyn VerifierCache>>,
 	/// The pool adapter
-	pub adapter: Arc<PoolAdapter>,
+	pub adapter: Arc<dyn PoolAdapter>,
 }
 
 impl TransactionPool {
 	/// Create a new transaction pool
 	pub fn new(
 		config: PoolConfig,
-		chain: Arc<BlockChain>,
-		verifier_cache: Arc<RwLock<VerifierCache>>,
-		adapter: Arc<PoolAdapter>,
+		chain: Arc<dyn BlockChain>,
+		verifier_cache: Arc<RwLock<dyn VerifierCache>>,
+		adapter: Arc<dyn PoolAdapter>,
 	) -> TransactionPool {
 		TransactionPool {
 			config,
@@ -87,14 +86,16 @@ impl TransactionPool {
 		Ok(())
 	}
 
-	fn add_to_reorg_cache(&mut self, entry: PoolEntry) -> Result<(), PoolError> {
+	fn add_to_reorg_cache(&mut self, entry: PoolEntry) {
 		let mut cache = self.reorg_cache.write();
 		cache.push_back(entry);
-		if cache.len() > REORG_CACHE_SIZE {
-			cache.pop_front();
+
+		// We cache 30 mins of txs but we have a hard limit to avoid catastrophic failure.
+		// For simplicity use the same value as the actual tx pool limit.
+		if cache.len() > self.config.max_pool_size {
+			let _ = cache.pop_front();
 		}
 		debug!("added tx to reorg_cache: size now {}", cache.len());
-		Ok(())
 	}
 
 	fn add_to_txpool(
@@ -141,7 +142,7 @@ impl TransactionPool {
 		}
 
 		// Do we have the capacity to accept this transaction?
-		self.is_acceptable(&tx)?;
+		self.is_acceptable(&tx, stem)?;
 
 		// Make sure the transaction is valid before anything else.
 		tx.validate(self.verifier_cache.clone())
@@ -160,23 +161,50 @@ impl TransactionPool {
 			tx,
 		};
 
-		if stem {
-			// TODO - what happens to txs in the stempool in a re-org scenario?
+		// If we are in "stem" mode then check if this is a new tx or if we have seen it before.
+		// If new tx - add it to our stempool.
+		// If we have seen any of the kernels before then fallback to fluff,
+		// adding directly to txpool.
+		if stem
+			&& self
+				.stempool
+				.find_matching_transactions(entry.tx.kernels())
+				.is_empty()
+		{
 			self.add_to_stempool(entry, header)?;
-		} else {
-			self.add_to_txpool(entry.clone(), header)?;
-			self.add_to_reorg_cache(entry)?;
+			return Ok(());
 		}
+
+		self.add_to_txpool(entry.clone(), header)?;
+		self.add_to_reorg_cache(entry);
 		Ok(())
 	}
 
-	fn reconcile_reorg_cache(&mut self, header: &BlockHeader) -> Result<(), PoolError> {
+	// Old txs will "age out" after 30 mins.
+	pub fn truncate_reorg_cache(&mut self, cutoff: DateTime<Utc>) {
+		let mut cache = self.reorg_cache.write();
+
+		while cache.front().map(|x| x.tx_at < cutoff).unwrap_or(false) {
+			let _ = cache.pop_front();
+		}
+
+		debug!("truncate_reorg_cache: size: {}", cache.len());
+	}
+
+	pub fn reconcile_reorg_cache(&mut self, header: &BlockHeader) -> Result<(), PoolError> {
 		let entries = self.reorg_cache.read().iter().cloned().collect::<Vec<_>>();
-		debug!("reconcile_reorg_cache: size: {} ...", entries.len());
+		debug!(
+			"reconcile_reorg_cache: size: {}, block: {:?} ...",
+			entries.len(),
+			header.hash(),
+		);
 		for entry in entries {
 			let _ = &self.add_to_txpool(entry.clone(), header);
 		}
-		debug!("reconcile_reorg_cache: ... done.");
+		debug!(
+			"reconcile_reorg_cache: block: {:?} ... done.",
+			header.hash()
+		);
 		Ok(())
 	}
 
@@ -187,10 +215,6 @@ impl TransactionPool {
 		self.txpool.reconcile_block(block);
 		self.txpool.reconcile(None, &block.header)?;
 
-		// Take our "reorg_cache" and see if this block means
-		// we need to (re)add old txs due to a fork and re-org.
-		self.reconcile_reorg_cache(&block.header)?;
-
 		// Now reconcile our stempool, accounting for the updated txpool txs.
 		self.stempool.reconcile_block(block);
 		{
@@ -199,6 +223,11 @@ impl TransactionPool {
 		}
 
 		Ok(())
+	}
+
+	/// Retrieve individual transaction for the given kernel hash.
+	pub fn retrieve_tx_by_kernel_hash(&self, hash: Hash) -> Option<Transaction> {
+		self.txpool.retrieve_tx_by_kernel_hash(hash)
 	}
 
 	/// Retrieve all transactions matching the provided "compact block"
@@ -215,10 +244,18 @@ impl TransactionPool {
 
 	/// Whether the transaction is acceptable to the pool, given both how
 	/// full the pool is and the transaction weight.
-	fn is_acceptable(&self, tx: &Transaction) -> Result<(), PoolError> {
+	fn is_acceptable(&self, tx: &Transaction, stem: bool) -> Result<(), PoolError> {
 		if self.total_size() > self.config.max_pool_size {
 			// TODO evict old/large transactions instead
 			return Err(PoolError::OverCapacity);
+		}
+
+		// Check that the stempool can accept this transaction
+		if stem {
+			if self.stempool.size() > self.config.max_stempool_size {
+				// TODO evict old/large transactions instead
+				return Err(PoolError::OverCapacity);
+			}
 		}
 
 		// for a basic transaction (1 input, 2 outputs) -
@@ -242,6 +279,7 @@ impl TransactionPool {
 	/// Returns a vector of transactions from the txpool so we can build a
 	/// block from them.
 	pub fn prepare_mineable_transactions(&self) -> Result<Vec<Transaction>, PoolError> {
-		self.txpool.prepare_mineable_transactions()
+		self.txpool
+			.prepare_mineable_transactions(self.config.mineable_max_weight)
 	}
 }

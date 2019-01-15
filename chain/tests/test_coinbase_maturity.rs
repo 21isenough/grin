@@ -12,30 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate chrono;
-extern crate env_logger;
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_keychain as keychain;
-extern crate grin_store as store;
-extern crate grin_util as util;
-extern crate grin_wallet as wallet;
-extern crate rand;
-
+use self::chain::types::NoopAdapter;
+use self::chain::ErrorKind;
+use self::core::core::verifier_cache::LruVerifierCache;
+use self::core::global::{self, ChainTypes};
+use self::core::libtx::{self, build};
+use self::core::pow::Difficulty;
+use self::core::{consensus, pow};
+use self::keychain::{ExtKeychain, ExtKeychainPath, Keychain};
+use self::util::{Mutex, RwLock, StopState};
 use chrono::Duration;
+use env_logger;
+use grin_chain as chain;
+use grin_core as core;
+use grin_keychain as keychain;
+use grin_store as store;
+use grin_util as util;
 use std::fs;
 use std::sync::Arc;
-use util::RwLock;
-
-use chain::types::NoopAdapter;
-use chain::ErrorKind;
-use core::core::transaction;
-use core::core::verifier_cache::LruVerifierCache;
-use core::global::{self, ChainTypes};
-use core::pow::Difficulty;
-use core::{consensus, pow};
-use keychain::{ExtKeychain, ExtKeychainPath, Keychain};
-use wallet::libtx::{self, build};
 
 fn clean_output_dir(dir_name: &str) {
 	let _ = fs::remove_dir_all(dir_name);
@@ -60,38 +54,37 @@ fn test_coinbase_maturity() {
 		pow::verify_size,
 		verifier_cache,
 		false,
-	).unwrap();
+		Arc::new(Mutex::new(StopState::new())),
+	)
+	.unwrap();
 
 	let prev = chain.head_header().unwrap();
 
-	let keychain = ExtKeychain::from_random_seed().unwrap();
+	let keychain = ExtKeychain::from_random_seed(false).unwrap();
 	let key_id1 = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
 	let key_id2 = ExtKeychainPath::new(1, 2, 0, 0, 0).to_identifier();
 	let key_id3 = ExtKeychainPath::new(1, 3, 0, 0, 0).to_identifier();
 	let key_id4 = ExtKeychainPath::new(1, 4, 0, 0, 0).to_identifier();
 
 	let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
-	let reward = libtx::reward::output(&keychain, &key_id1, 0, prev.height).unwrap();
+	let reward = libtx::reward::output(&keychain, &key_id1, 0).unwrap();
 	let mut block = core::core::Block::new(&prev, vec![], Difficulty::min(), reward).unwrap();
 	block.header.timestamp = prev.timestamp + Duration::seconds(60);
 	block.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-	chain.set_txhashset_roots(&mut block, false).unwrap();
+	chain.set_txhashset_roots(&mut block).unwrap();
 
 	pow::pow_size(
 		&mut block.header,
 		next_header_info.difficulty,
 		global::proofsize(),
 		global::min_edge_bits(),
-	).unwrap();
+	)
+	.unwrap();
 
 	assert_eq!(block.outputs().len(), 1);
 	let coinbase_output = block.outputs()[0];
-	assert!(
-		coinbase_output
-			.features
-			.contains(transaction::OutputFeatures::COINBASE_OUTPUT)
-	);
+	assert!(coinbase_output.is_coinbase());
 
 	chain
 		.process_block(block.clone(), chain::Options::MINE)
@@ -113,17 +106,18 @@ fn test_coinbase_maturity() {
 			build::with_fee(2),
 		],
 		&keychain,
-	).unwrap();
+	)
+	.unwrap();
 
 	let txs = vec![coinbase_txn.clone()];
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
-	let reward = libtx::reward::output(&keychain, &key_id3, fees, prev.height).unwrap();
+	let reward = libtx::reward::output(&keychain, &key_id3, fees).unwrap();
 	let mut block = core::core::Block::new(&prev, txs, Difficulty::min(), reward).unwrap();
 	let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
 	block.header.timestamp = prev.timestamp + Duration::seconds(60);
 	block.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-	chain.set_txhashset_roots(&mut block, false).unwrap();
+	chain.set_txhashset_roots(&mut block).unwrap();
 
 	// Confirm the tx attempting to spend the coinbase output
 	// is not valid at the current block height given the current chain state.
@@ -140,30 +134,32 @@ fn test_coinbase_maturity() {
 		next_header_info.difficulty,
 		global::proofsize(),
 		global::min_edge_bits(),
-	).unwrap();
+	)
+	.unwrap();
 
 	// mine enough blocks to increase the height sufficiently for
 	// coinbase to reach maturity and be spendable in the next block
 	for _ in 0..3 {
 		let prev = chain.head_header().unwrap();
 
-		let keychain = ExtKeychain::from_random_seed().unwrap();
+		let keychain = ExtKeychain::from_random_seed(false).unwrap();
 		let pk = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
 
-		let reward = libtx::reward::output(&keychain, &pk, 0, prev.height).unwrap();
+		let reward = libtx::reward::output(&keychain, &pk, 0).unwrap();
 		let mut block = core::core::Block::new(&prev, vec![], Difficulty::min(), reward).unwrap();
 		let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
 		block.header.timestamp = prev.timestamp + Duration::seconds(60);
 		block.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-		chain.set_txhashset_roots(&mut block, false).unwrap();
+		chain.set_txhashset_roots(&mut block).unwrap();
 
 		pow::pow_size(
 			&mut block.header,
 			next_header_info.difficulty,
 			global::proofsize(),
 			global::min_edge_bits(),
-		).unwrap();
+		)
+		.unwrap();
 
 		chain.process_block(block, chain::Options::MINE).unwrap();
 	}
@@ -177,20 +173,21 @@ fn test_coinbase_maturity() {
 	let txs = vec![coinbase_txn];
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
 	let next_header_info = consensus::next_difficulty(1, chain.difficulty_iter());
-	let reward = libtx::reward::output(&keychain, &key_id4, fees, prev.height).unwrap();
+	let reward = libtx::reward::output(&keychain, &key_id4, fees).unwrap();
 	let mut block = core::core::Block::new(&prev, txs, Difficulty::min(), reward).unwrap();
 
 	block.header.timestamp = prev.timestamp + Duration::seconds(60);
 	block.header.pow.secondary_scaling = next_header_info.secondary_scaling;
 
-	chain.set_txhashset_roots(&mut block, false).unwrap();
+	chain.set_txhashset_roots(&mut block).unwrap();
 
 	pow::pow_size(
 		&mut block.header,
 		next_header_info.difficulty,
 		global::proofsize(),
 		global::min_edge_bits(),
-	).unwrap();
+	)
+	.unwrap();
 
 	let result = chain.process_block(block, chain::Options::MINE);
 	match result {

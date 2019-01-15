@@ -15,21 +15,21 @@
 //! Build a block to mine: gathers transactions from the pool, assembles
 //! them into a block and returns it.
 
+use crate::util::RwLock;
 use chrono::prelude::{DateTime, NaiveDateTime, Utc};
 use rand::{thread_rng, Rng};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use util::RwLock;
 
-use chain;
-use common::types::Error;
-use core::core::verifier_cache::VerifierCache;
-use core::{consensus, core, ser};
-use keychain::{ExtKeychain, Identifier, Keychain};
-use pool;
-use util;
-use wallet::{self, BlockFees};
+use crate::chain;
+use crate::common::types::Error;
+use crate::core::core::verifier_cache::VerifierCache;
+use crate::core::{consensus, core, global, ser};
+use crate::keychain::{ExtKeychain, Identifier, Keychain};
+use crate::pool;
+use crate::util;
+use crate::wallet::{self, BlockFees};
 
 // Ensure a block suitable for mining is built and returned
 // If a wallet listener URL is not provided the reward will be "burnt"
@@ -37,7 +37,7 @@ use wallet::{self, BlockFees};
 pub fn get_block(
 	chain: &Arc<chain::Chain>,
 	tx_pool: &Arc<RwLock<pool::TransactionPool>>,
-	verifier_cache: Arc<RwLock<VerifierCache>>,
+	verifier_cache: Arc<RwLock<dyn VerifierCache>>,
 	key_id: Option<Identifier>,
 	wallet_listener_url: Option<String>,
 ) -> (core::Block, BlockFees) {
@@ -90,7 +90,7 @@ pub fn get_block(
 fn build_block(
 	chain: &Arc<chain::Chain>,
 	tx_pool: &Arc<RwLock<pool::TransactionPool>>,
-	verifier_cache: Arc<RwLock<VerifierCache>>,
+	verifier_cache: Arc<RwLock<dyn VerifierCache>>,
 	key_id: Option<Identifier>,
 	wallet_listener_url: Option<String>,
 ) -> Result<(core::Block, BlockFees), Error> {
@@ -120,7 +120,7 @@ fn build_block(
 	};
 
 	let (output, kernel, block_fees) = get_coinbase(wallet_listener_url, block_fees)?;
-	let mut b = core::Block::with_reward(&head, txs, output, kernel, difficulty.difficulty)?;
+	let mut b = core::Block::from_reward(&head, txs, output, kernel, difficulty.difficulty)?;
 
 	// making sure we're not spending time mining a useless block
 	b.validate(&head.total_kernel_offset, verifier_cache)?;
@@ -129,17 +129,16 @@ fn build_block(
 	b.header.pow.secondary_scaling = difficulty.secondary_scaling;
 	b.header.timestamp = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(now_sec, 0), Utc);
 
-	let b_difficulty = (b.header.total_difficulty() - head.total_difficulty()).to_num();
 	debug!(
-		"Built new block with {} inputs and {} outputs, network difficulty: {}, cumulative difficulty {}",
+		"Built new block with {} inputs and {} outputs, block difficulty: {}, cumulative difficulty {}",
 		b.inputs().len(),
 		b.outputs().len(),
-		b_difficulty,
+		difficulty.difficulty,
 		b.header.total_difficulty().to_num(),
 	);
 
 	// Now set txhashset roots and sizes on the header of the block being built.
-	let roots_result = chain.set_txhashset_roots(&mut b, false);
+	let roots_result = chain.set_txhashset_roots(&mut b);
 
 	match roots_result {
 		Ok(_) => Ok((b, block_fees)),
@@ -170,11 +169,10 @@ fn build_block(
 ///
 fn burn_reward(block_fees: BlockFees) -> Result<(core::Output, core::TxKernel, BlockFees), Error> {
 	warn!("Burning block fees: {:?}", block_fees);
-	let keychain = ExtKeychain::from_random_seed().unwrap();
+	let keychain = ExtKeychain::from_random_seed(global::is_floonet()).unwrap();
 	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 	let (out, kernel) =
-		wallet::libtx::reward::output(&keychain, &key_id, block_fees.fees, block_fees.height)
-			.unwrap();
+		crate::core::libtx::reward::output(&keychain, &key_id, block_fees.fees).unwrap();
 	Ok((out, kernel, block_fees))
 }
 

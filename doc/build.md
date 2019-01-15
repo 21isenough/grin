@@ -12,7 +12,7 @@ What's working so far?
 
 ## Requirements
 
-* rust 1.26+ (use [rustup]((https://www.rustup.rs/))- i.e. `curl https://sh.rustup.rs -sSf | sh; source $HOME/.cargo/env`)
+* rust 1.31+ (use [rustup]((https://www.rustup.rs/))- i.e. `curl https://sh.rustup.rs -sSf | sh; source $HOME/.cargo/env`)
   * if rust is already installed, you can simply update version with `rustup update`
 * clang
 * ncurses and libs (ncurses, ncursesw5)
@@ -20,11 +20,12 @@ What's working so far?
 * pkg-config
 * libssl-dev
 * linux-headers (reported needed on Alpine linux)
+* llvm
 
 For Debian-based distributions (Debian, Ubuntu, Mint, etc), all in one line (except Rust):
 
 ```sh
-apt install build-essential cmake git libgit2-dev clang libncurses5-dev libncursesw5-dev zlib1g-dev pkg-config libssl-dev
+apt install build-essential cmake git libgit2-dev clang libncurses5-dev libncursesw5-dev zlib1g-dev pkg-config libssl-dev llvm
 ```
 
 ## Build steps
@@ -93,14 +94,17 @@ grin client help
 ## Docker
 
 ```sh
-docker build -t grin .
+docker build -t grin -f etc/Dockerfile .
 ```
+For floonet, use `etc/Dockerfile.floonet` instead
 
 You can bind-mount your grin cache to run inside the container.
 
 ```sh
 docker run -it -d -v $HOME/.grin:/root/.grin grin
 ```
+If you prefer to use a docker named volume, you can pass `-v dotgrin:/root/.grin` instead.
+Using a named volume copies default configurations upon volume creation
 
 ## Cross-platform builds
 
@@ -118,5 +122,8 @@ troubleshooting, etc.
 ## Mining in Grin
 
 Please note that all mining functions for Grin have moved into a separate, standalone package called
-[grin_miner](https://github.com/mimblewimble/grin-miner). Once your Grin code node is up and running,
+[grin-miner](https://github.com/mimblewimble/grin-miner). Once your Grin code node is up and running,
 you can start mining by building and running grin-miner against your running Grin node.
+
+For grin-miner to be able to communicate with your grin node, make sure that you have `enable_stratum_server = true`
+in your `grin-server.toml` configuration file and you have a wallet listener running (`grin wallet listen`). 

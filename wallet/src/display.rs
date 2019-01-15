@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::core::{self, amount_to_hr_string};
-use libwallet::types::{AcctPathMapping, OutputData, OutputStatus, TxLogEntry, WalletInfo};
-use libwallet::Error;
+use crate::core::core::{self, amount_to_hr_string};
+use crate::core::global;
+use crate::libwallet::types::{AcctPathMapping, OutputData, OutputStatus, TxLogEntry, WalletInfo};
+use crate::libwallet::Error;
+use crate::util;
+use crate::util::secp::pedersen;
 use prettytable;
 use std::io::prelude::Write;
 use term;
-use util;
-use util::secp::pedersen;
 
 /// Display outputs in a pretty way
 pub fn outputs(
@@ -27,6 +28,7 @@ pub fn outputs(
 	cur_height: u64,
 	validated: bool,
 	outputs: Vec<(OutputData, pedersen::Commitment)>,
+	dark_background_color_scheme: bool,
 ) -> Result<(), Error> {
 	let title = format!(
 		"Wallet Outputs - Account '{}' - Block Height: {}",
@@ -42,6 +44,7 @@ pub fn outputs(
 
 	table.set_titles(row![
 		bMG->"Output Commitment",
+		bMG->"MMR Index",
 		bMG->"Block Height",
 		bMG->"Locked Until",
 		bMG->"Status",
@@ -53,6 +56,10 @@ pub fn outputs(
 
 	for (out, commit) in outputs {
 		let commit = format!("{}", util::to_hex(commit.as_ref().to_vec()));
+		let index = match out.mmr_index {
+			None => "None".to_owned(),
+			Some(t) => t.to_string(),
+		};
 		let height = format!("{}", out.height);
 		let lock_height = format!("{}", out.lock_height);
 		let is_coinbase = format!("{}", out.is_coinbase);
@@ -69,16 +76,31 @@ pub fn outputs(
 			None => "".to_owned(),
 			Some(t) => t.to_string(),
 		};
-		table.add_row(row![
-			bFC->commit,
-			bFB->height,
-			bFB->lock_height,
-			bFR->status,
-			bFY->is_coinbase,
-			bFB->num_confirmations,
-			bFG->value,
-			bFC->tx,
-		]);
+
+		if dark_background_color_scheme {
+			table.add_row(row![
+				bFC->commit,
+				bFB->index,
+				bFB->height,
+				bFB->lock_height,
+				bFR->status,
+				bFY->is_coinbase,
+				bFB->num_confirmations,
+				bFG->value,
+				bFC->tx,
+			]);
+		} else {
+			table.add_row(row![
+				bFD->commit,
+				bFB->height,
+				bFB->lock_height,
+				bFR->status,
+				bFD->is_coinbase,
+				bFB->num_confirmations,
+				bFG->value,
+				bFD->tx,
+			]);
+		}
 	}
 
 	table.set_format(*prettytable::format::consts::FORMAT_NO_COLSEP);
@@ -102,6 +124,7 @@ pub fn txs(
 	validated: bool,
 	txs: Vec<TxLogEntry>,
 	include_status: bool,
+	dark_background_color_scheme: bool,
 ) -> Result<(), Error> {
 	let title = format!(
 		"Transaction Log - Account '{}' - Block Height: {}",
@@ -122,13 +145,13 @@ pub fn txs(
 		bMG->"Creation Time",
 		bMG->"Confirmed?",
 		bMG->"Confirmation Time",
-		bMG->"Num. Inputs",
-		bMG->"Num. Outputs",
-		bMG->"Amount Credited",
-		bMG->"Amount Debited",
+		bMG->"Num. \nInputs",
+		bMG->"Num. \nOutputs",
+		bMG->"Amount \nCredited",
+		bMG->"Amount \nDebited",
 		bMG->"Fee",
-		bMG->"Net Difference",
-		bMG->"Tx Data",
+		bMG->"Net \nDifference",
+		bMG->"Tx \nData",
 	]);
 
 	for t in txs {
@@ -160,25 +183,61 @@ pub fn txs(
 				core::amount_to_hr_string(t.amount_debited - t.amount_credited, true)
 			)
 		};
-		let tx_data = match t.tx_hex {
-			Some(_) => format!("Exists"),
+		let tx_data = match t.stored_tx {
+			Some(t) => format!("{}", t),
 			None => "None".to_owned(),
 		};
-		table.add_row(row![
-			bFC->id,
-			bFC->entry_type,
-			bFC->slate_id,
-			bFB->creation_ts,
-			bFC->confirmed,
-			bFB->confirmation_ts,
-			bFC->num_inputs,
-			bFC->num_outputs,
-			bFG->amount_credited_str,
-			bFR->amount_debited_str,
-			bFR->fee,
-			bFY->net_diff,
-			bFb->tx_data,
-		]);
+		if dark_background_color_scheme {
+			table.add_row(row![
+				bFC->id,
+				bFC->entry_type,
+				bFC->slate_id,
+				bFB->creation_ts,
+				bFC->confirmed,
+				bFB->confirmation_ts,
+				bFC->num_inputs,
+				bFC->num_outputs,
+				bFG->amount_credited_str,
+				bFR->amount_debited_str,
+				bFR->fee,
+				bFY->net_diff,
+				bFb->tx_data,
+			]);
+		} else {
+			if t.confirmed {
+				table.add_row(row![
+					bFD->id,
+					bFb->entry_type,
+					bFD->slate_id,
+					bFB->creation_ts,
+					bFg->confirmed,
+					bFB->confirmation_ts,
+					bFD->num_inputs,
+					bFD->num_outputs,
+					bFG->amount_credited_str,
+					bFD->amount_debited_str,
+					bFD->fee,
+					bFG->net_diff,
+					bFB->tx_data,
+				]);
+			} else {
+				table.add_row(row![
+					bFD->id,
+					bFb->entry_type,
+					bFD->slate_id,
+					bFB->creation_ts,
+					bFR->confirmed,
+					bFB->confirmation_ts,
+					bFD->num_inputs,
+					bFD->num_outputs,
+					bFG->amount_credited_str,
+					bFD->amount_debited_str,
+					bFD->fee,
+					bFG->net_diff,
+					bFB->tx_data,
+				]);
+			}
+		}
 	}
 
 	table.set_format(*prettytable::format::consts::FORMAT_NO_COLSEP);
@@ -195,19 +254,78 @@ pub fn txs(
 	Ok(())
 }
 /// Display summary info in a pretty way
-pub fn info(account: &str, wallet_info: &WalletInfo, validated: bool) {
+pub fn info(
+	account: &str,
+	wallet_info: &WalletInfo,
+	validated: bool,
+	dark_background_color_scheme: bool,
+) {
 	println!(
 		"\n____ Wallet Summary Info - Account '{}' as of height {} ____\n",
-		account, wallet_info.last_confirmed_height
+		account, wallet_info.last_confirmed_height,
 	);
-	let mut table = table!(
-		[bFG->"Total", FG->amount_to_hr_string(wallet_info.total, false)],
-		[bFY->"Awaiting Confirmation", FY->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)],
-		[bFY->"Immature Coinbase", FY->amount_to_hr_string(wallet_info.amount_immature, false)],
-		[bFG->"Currently Spendable", FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)],
-		[Fw->"---------", Fw->"---------"],
-		[Fr->"(Locked by previous transaction)", Fr->amount_to_hr_string(wallet_info.amount_locked, false)]
-	);
+
+	let mut table = table!();
+
+	if dark_background_color_scheme {
+		table.add_row(row![
+			bFG->"Total",
+			FG->amount_to_hr_string(wallet_info.total, false)
+		]);
+		// Only dispay "Immature Coinbase" if we have related outputs in the wallet.
+		// This row just introduces confusion if the wallet does not receive coinbase rewards.
+		if wallet_info.amount_immature > 0 {
+			table.add_row(row![
+				bFY->format!("Immature Coinbase (< {})", global::coinbase_maturity()),
+				FY->amount_to_hr_string(wallet_info.amount_immature, false)
+			]);
+		}
+		table.add_row(row![
+			bFY->format!("Awaiting Confirmation (< {})", wallet_info.minimum_confirmations),
+			FY->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)
+		]);
+		table.add_row(row![
+			Fr->"Locked by previous transaction",
+			Fr->amount_to_hr_string(wallet_info.amount_locked, false)
+		]);
+		table.add_row(row![
+			Fw->"--------------------------------",
+			Fw->"-------------"
+		]);
+		table.add_row(row![
+			bFG->"Currently Spendable",
+			FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)
+		]);
+	} else {
+		table.add_row(row![
+			bFG->"Total",
+			FG->amount_to_hr_string(wallet_info.total, false)
+		]);
+		// Only dispay "Immature Coinbase" if we have related outputs in the wallet.
+		// This row just introduces confusion if the wallet does not receive coinbase rewards.
+		if wallet_info.amount_immature > 0 {
+			table.add_row(row![
+				bFB->format!("Immature Coinbase (< {})", global::coinbase_maturity()),
+				FB->amount_to_hr_string(wallet_info.amount_immature, false)
+			]);
+		}
+		table.add_row(row![
+			bFB->format!("Awaiting Confirmation (< {})", wallet_info.minimum_confirmations),
+			FB->amount_to_hr_string(wallet_info.amount_awaiting_confirmation, false)
+		]);
+		table.add_row(row![
+			Fr->"Locked by previous transaction",
+			Fr->amount_to_hr_string(wallet_info.amount_locked, false)
+		]);
+		table.add_row(row![
+			Fw->"--------------------------------",
+			Fw->"-------------"
+		]);
+		table.add_row(row![
+			bFG->"Currently Spendable",
+			FG->amount_to_hr_string(wallet_info.amount_currently_spendable, false)
+		]);
+	};
 	table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 	table.printstd();
 	println!();

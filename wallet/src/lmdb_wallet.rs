@@ -16,20 +16,33 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::{fs, path};
 
+// for writing storedtransaction files
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+
+use serde_json;
+
 use failure::ResultExt;
 use uuid::Uuid;
 
-use keychain::{ChildNumber, ExtKeychain, Identifier, Keychain};
-use store::{self, option_to_not_found, to_key, to_key_u64};
+use crate::blake2::blake2b::Blake2b;
 
-use libwallet::types::*;
-use libwallet::{internal, Error, ErrorKind};
-use types::{WalletConfig, WalletSeed};
-use util::secp::pedersen;
+use crate::keychain::{ChildNumber, ExtKeychain, Identifier, Keychain};
+use crate::store::{self, option_to_not_found, to_key, to_key_u64};
+
+use crate::core::core::Transaction;
+use crate::core::{global, ser};
+use crate::libwallet::types::*;
+use crate::libwallet::{internal, Error, ErrorKind};
+use crate::types::{WalletConfig, WalletSeed};
+use crate::util;
+use crate::util::secp::constants::SECRET_KEY_SIZE;
+use crate::util::ZeroingString;
 
 pub const DB_DIR: &'static str = "db";
+pub const TX_SAVE_DIR: &'static str = "saved_txs";
 
-const COMMITMENT_PREFIX: u8 = 'C' as u8;
 const OUTPUT_PREFIX: u8 = 'o' as u8;
 const DERIV_PREFIX: u8 = 'd' as u8;
 const CONFIRMED_HEIGHT_PREFIX: u8 = 'c' as u8;
@@ -51,28 +64,67 @@ pub fn wallet_db_exists(config: WalletConfig) -> bool {
 	db_path.exists()
 }
 
+/// Helper to derive XOR keys for storing private transaction keys in the DB
+/// (blind_xor_key, nonce_xor_key)
+fn private_ctx_xor_keys<K>(
+	keychain: &K,
+	slate_id: &[u8],
+) -> Result<([u8; SECRET_KEY_SIZE], [u8; SECRET_KEY_SIZE]), Error>
+where
+	K: Keychain,
+{
+	let root_key = keychain.derive_key(0, &K::root_key_id())?;
+
+	// derive XOR values for storing secret values in DB
+	// h(root_key|slate_id|"blind")
+	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
+	hasher.update(&root_key.0[..]);
+	hasher.update(&slate_id[..]);
+	hasher.update(&"blind".as_bytes()[..]);
+	let blind_xor_key = hasher.finalize();
+	let mut ret_blind = [0; SECRET_KEY_SIZE];
+	ret_blind.copy_from_slice(&blind_xor_key.as_bytes()[0..SECRET_KEY_SIZE]);
+
+	// h(root_key|slate_id|"nonce")
+	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
+	hasher.update(&root_key.0[..]);
+	hasher.update(&slate_id[..]);
+	hasher.update(&"nonce".as_bytes()[..]);
+	let nonce_xor_key = hasher.finalize();
+	let mut ret_nonce = [0; SECRET_KEY_SIZE];
+	ret_nonce.copy_from_slice(&nonce_xor_key.as_bytes()[0..SECRET_KEY_SIZE]);
+
+	Ok((ret_blind, ret_nonce))
+}
+
 pub struct LMDBBackend<C, K> {
 	db: store::Store,
 	config: WalletConfig,
 	/// passphrase: TODO better ways of dealing with this other than storing
-	passphrase: String,
+	passphrase: ZeroingString,
 	/// Keychain
 	pub keychain: Option<K>,
 	/// Parent path to use by default for output operations
 	parent_key_id: Identifier,
-	/// client
-	client: C,
+	/// wallet to node client
+	w2n_client: C,
 }
 
 impl<C, K> LMDBBackend<C, K> {
-	pub fn new(config: WalletConfig, passphrase: &str, client: C) -> Result<Self, Error> {
+	pub fn new(config: WalletConfig, passphrase: &str, n_client: C) -> Result<Self, Error> {
 		let db_path = path::Path::new(&config.data_file_dir).join(DB_DIR);
 		fs::create_dir_all(&db_path).expect("Couldn't create wallet backend directory!");
+
+		let stored_tx_path = path::Path::new(&config.data_file_dir).join(TX_SAVE_DIR);
+		fs::create_dir_all(&stored_tx_path)
+			.expect("Couldn't create wallet backend tx storage directory!");
 
 		let lmdb_env = Arc::new(store::new_env(db_path.to_str().unwrap().to_string()));
 		let store = store::Store::open(lmdb_env, DB_DIR);
 
 		// Make sure default wallet derivation path always exists
+		// as well as path (so it can be retrieved by batches to know where to store
+		// completed transactions, for reference
 		let default_account = AcctPathMapping {
 			label: "default".to_owned(),
 			path: LMDBBackend::<C, K>::default_path(),
@@ -91,10 +143,10 @@ impl<C, K> LMDBBackend<C, K> {
 		let res = LMDBBackend {
 			db: store,
 			config: config.clone(),
-			passphrase: String::from(passphrase),
+			passphrase: ZeroingString::from(passphrase),
 			keychain: None,
 			parent_key_id: LMDBBackend::<C, K>::default_path(),
-			client: client,
+			w2n_client: n_client,
 		};
 		Ok(res)
 	}
@@ -116,17 +168,18 @@ impl<C, K> LMDBBackend<C, K> {
 
 impl<C, K> WalletBackend<C, K> for LMDBBackend<C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	/// Initialise with whatever stored credentials we have
 	fn open_with_credentials(&mut self) -> Result<(), Error> {
-		let wallet_seed = WalletSeed::from_file(&self.config)
+		let wallet_seed = WalletSeed::from_file(&self.config, &self.passphrase)
 			.context(ErrorKind::CallbackImpl("Error opening wallet"))?;
-		let keychain = wallet_seed.derive_keychain(&self.passphrase);
-		self.keychain = Some(keychain.context(ErrorKind::CallbackImpl("Error deriving keychain"))?);
-		// Just blow up password for now after it's been used
-		self.passphrase = String::from("");
+		self.keychain = Some(
+			wallet_seed
+				.derive_keychain(global::is_floonet())
+				.context(ErrorKind::CallbackImpl("Error deriving keychain"))?,
+		);
 		Ok(())
 	}
 
@@ -141,9 +194,24 @@ where
 		self.keychain.as_mut().unwrap()
 	}
 
-	/// Return the client being used
-	fn client(&mut self) -> &mut C {
-		&mut self.client
+	/// Return the node client being used
+	fn w2n_client(&mut self) -> &mut C {
+		&mut self.w2n_client
+	}
+
+	/// return the version of the commit for caching
+	fn calc_commit_for_cache(
+		&mut self,
+		amount: u64,
+		id: &Identifier,
+	) -> Result<Option<String>, Error> {
+		if self.config.no_commit_cache == Some(true) {
+			Ok(None)
+		} else {
+			Ok(Some(util::to_hex(
+				self.keychain().commit(amount, &id)?.0.to_vec(),
+			)))
+		}
 	}
 
 	/// Set parent path by account name
@@ -167,39 +235,15 @@ where
 		self.parent_key_id.clone()
 	}
 
-	fn get(&self, id: &Identifier) -> Result<OutputData, Error> {
-		let key = to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec());
+	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error> {
+		let key = match mmr_index {
+			Some(i) => to_key_u64(OUTPUT_PREFIX, &mut id.to_bytes().to_vec(), *i),
+			None => to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec()),
+		};
 		option_to_not_found(self.db.get_ser(&key), &format!("Key Id: {}", id)).map_err(|e| e.into())
 	}
 
-	fn get_commitment(&mut self, id: &Identifier) -> Result<pedersen::Commitment, Error> {
-		let key = to_key(COMMITMENT_PREFIX, &mut id.to_bytes().to_vec());
-
-		let res: Result<pedersen::Commitment, Error> =
-			option_to_not_found(self.db.get_ser(&key), &format!("Key Id: {}", id))
-				.map_err(|e| e.into());
-
-		// "cache hit" and return the commitment
-		if let Ok(commit) = res {
-			Ok(commit)
-		} else {
-			let out = self.get(id)?;
-
-			// Save the output data back to the db
-			// which builds and saves the associated commitment.
-			{
-				let mut batch = self.batch()?;
-				batch.save(out)?;
-				batch.commit()?;
-			}
-
-			// Now retrieve the saved commitment and return it.
-			option_to_not_found(self.db.get_ser(&key), &format!("Key Id: {}", id))
-				.map_err(|e| e.into())
-		}
-	}
-
-	fn iter<'a>(&'a self) -> Box<Iterator<Item = OutputData> + 'a> {
+	fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = OutputData> + 'a> {
 		Box::new(self.db.iter(&[OUTPUT_PREFIX]).unwrap())
 	}
 
@@ -208,19 +252,28 @@ where
 		self.db.get_ser(&key).map_err(|e| e.into())
 	}
 
-	fn tx_log_iter<'a>(&'a self) -> Box<Iterator<Item = TxLogEntry> + 'a> {
+	fn tx_log_iter<'a>(&'a self) -> Box<dyn Iterator<Item = TxLogEntry> + 'a> {
 		Box::new(self.db.iter(&[TX_LOG_ENTRY_PREFIX]).unwrap())
 	}
 
 	fn get_private_context(&mut self, slate_id: &[u8]) -> Result<Context, Error> {
 		let ctx_key = to_key(PRIVATE_TX_CONTEXT_PREFIX, &mut slate_id.to_vec());
-		option_to_not_found(
+		let (blind_xor_key, nonce_xor_key) = private_ctx_xor_keys(self.keychain(), slate_id)?;
+
+		let mut ctx: Context = option_to_not_found(
 			self.db.get_ser(&ctx_key),
 			&format!("Slate id: {:x?}", slate_id.to_vec()),
-		).map_err(|e| e.into())
+		)?;
+
+		for i in 0..SECRET_KEY_SIZE {
+			ctx.sec_key.0[i] = ctx.sec_key.0[i] ^ blind_xor_key[i];
+			ctx.sec_nonce.0[i] = ctx.sec_nonce.0[i] ^ nonce_xor_key[i];
+		}
+
+		Ok(ctx)
 	}
 
-	fn acct_path_iter<'a>(&'a self) -> Box<Iterator<Item = AcctPathMapping> + 'a> {
+	fn acct_path_iter<'a>(&'a self) -> Box<dyn Iterator<Item = AcctPathMapping> + 'a> {
 		Box::new(self.db.iter(&[ACCOUNT_PATH_MAPPING_PREFIX]).unwrap())
 	}
 
@@ -229,7 +282,38 @@ where
 		self.db.get_ser(&acct_key).map_err(|e| e.into())
 	}
 
-	fn batch<'a>(&'a mut self) -> Result<Box<WalletOutputBatch<K> + 'a>, Error> {
+	fn store_tx(&self, uuid: &str, tx: &Transaction) -> Result<(), Error> {
+		let filename = format!("{}.grintx", uuid);
+		let path = path::Path::new(&self.config.data_file_dir)
+			.join(TX_SAVE_DIR)
+			.join(filename);
+		let path_buf = Path::new(&path).to_path_buf();
+		let mut stored_tx = File::create(path_buf)?;
+		let tx_hex = util::to_hex(ser::ser_vec(tx).unwrap());;
+		stored_tx.write_all(&tx_hex.as_bytes())?;
+		stored_tx.sync_all()?;
+		Ok(())
+	}
+
+	fn get_stored_tx(&self, entry: &TxLogEntry) -> Result<Option<Transaction>, Error> {
+		let filename = match entry.stored_tx.clone() {
+			Some(f) => f,
+			None => return Ok(None),
+		};
+		let path = path::Path::new(&self.config.data_file_dir)
+			.join(TX_SAVE_DIR)
+			.join(filename);
+		let tx_file = Path::new(&path).to_path_buf();
+		let mut tx_f = File::open(tx_file)?;
+		let mut content = String::new();
+		tx_f.read_to_string(&mut content)?;
+		let tx_bin = util::from_hex(content).unwrap();
+		Ok(Some(
+			ser::deserialize::<Transaction>(&mut &tx_bin[..]).unwrap(),
+		))
+	}
+
+	fn batch<'a>(&'a mut self) -> Result<Box<dyn WalletOutputBatch<K> + 'a>, Error> {
 		Ok(Box::new(Batch {
 			_store: self,
 			db: RefCell::new(Some(self.db.batch()?)),
@@ -274,13 +358,18 @@ where
 		internal::restore::restore(self).context(ErrorKind::Restore)?;
 		Ok(())
 	}
+
+	fn check_repair(&mut self) -> Result<(), Error> {
+		internal::restore::check_repair(self).context(ErrorKind::Restore)?;
+		Ok(())
+	}
 }
 
 /// An atomic batch in which all changes can be committed all at once or
 /// discarded on error.
-pub struct Batch<'a, C: 'a, K: 'a>
+pub struct Batch<'a, C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	_store: &'a LMDBBackend<C, K>,
@@ -292,7 +381,7 @@ where
 #[allow(missing_docs)]
 impl<'a, C, K> WalletOutputBatch<K> for Batch<'a, C, K>
 where
-	C: WalletClient,
+	C: NodeClient,
 	K: Keychain,
 {
 	fn keychain(&mut self) -> &mut K {
@@ -302,29 +391,29 @@ where
 	fn save(&mut self, out: OutputData) -> Result<(), Error> {
 		// Save the output data to the db.
 		{
-			let key = to_key(OUTPUT_PREFIX, &mut out.key_id.to_bytes().to_vec());
+			let key = match out.mmr_index {
+				Some(i) => to_key_u64(OUTPUT_PREFIX, &mut out.key_id.to_bytes().to_vec(), i),
+				None => to_key(OUTPUT_PREFIX, &mut out.key_id.to_bytes().to_vec()),
+			};
 			self.db.borrow().as_ref().unwrap().put_ser(&key, &out)?;
-		}
-
-		// Save the associated output commitment.
-		{
-			let key = to_key(COMMITMENT_PREFIX, &mut out.key_id.to_bytes().to_vec());
-			let commit = self.keychain().commit(out.value, &out.key_id)?;
-			self.db.borrow().as_ref().unwrap().put_ser(&key, &commit)?;
 		}
 
 		Ok(())
 	}
 
-	fn get(&self, id: &Identifier) -> Result<OutputData, Error> {
-		let key = to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec());
+	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error> {
+		let key = match mmr_index {
+			Some(i) => to_key_u64(OUTPUT_PREFIX, &mut id.to_bytes().to_vec(), *i),
+			None => to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec()),
+		};
 		option_to_not_found(
 			self.db.borrow().as_ref().unwrap().get_ser(&key),
 			&format!("Key ID: {}", id),
-		).map_err(|e| e.into())
+		)
+		.map_err(|e| e.into())
 	}
 
-	fn iter(&self) -> Box<Iterator<Item = OutputData>> {
+	fn iter(&self) -> Box<dyn Iterator<Item = OutputData>> {
 		Box::new(
 			self.db
 				.borrow()
@@ -335,16 +424,13 @@ where
 		)
 	}
 
-	fn delete(&mut self, id: &Identifier) -> Result<(), Error> {
+	fn delete(&mut self, id: &Identifier, mmr_index: &Option<u64>) -> Result<(), Error> {
 		// Delete the output data.
 		{
-			let key = to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec());
-			let _ = self.db.borrow().as_ref().unwrap().delete(&key);
-		}
-
-		// Delete the associated output commitment.
-		{
-			let key = to_key(COMMITMENT_PREFIX, &mut id.to_bytes().to_vec());
+			let key = match mmr_index {
+				Some(i) => to_key_u64(OUTPUT_PREFIX, &mut id.to_bytes().to_vec(), *i),
+				None => to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec()),
+			};
 			let _ = self.db.borrow().as_ref().unwrap().delete(&key);
 		}
 
@@ -365,7 +451,7 @@ where
 		Ok(last_tx_log_id)
 	}
 
-	fn tx_log_iter(&self) -> Box<Iterator<Item = TxLogEntry>> {
+	fn tx_log_iter(&self) -> Box<dyn Iterator<Item = TxLogEntry>> {
 		Box::new(
 			self.db
 				.borrow()
@@ -403,17 +489,21 @@ where
 		Ok(())
 	}
 
-	fn save_tx_log_entry(&self, t: TxLogEntry, parent_id: &Identifier) -> Result<(), Error> {
+	fn save_tx_log_entry(
+		&mut self,
+		tx_in: TxLogEntry,
+		parent_id: &Identifier,
+	) -> Result<(), Error> {
 		let tx_log_key = to_key_u64(
 			TX_LOG_ENTRY_PREFIX,
 			&mut parent_id.to_bytes().to_vec(),
-			t.id as u64,
+			tx_in.id as u64,
 		);
 		self.db
 			.borrow()
 			.as_ref()
 			.unwrap()
-			.put_ser(&tx_log_key, &t)?;
+			.put_ser(&tx_log_key, &tx_in)?;
 		Ok(())
 	}
 
@@ -430,7 +520,7 @@ where
 		Ok(())
 	}
 
-	fn acct_path_iter(&self) -> Box<Iterator<Item = AcctPathMapping>> {
+	fn acct_path_iter(&self) -> Box<dyn Iterator<Item = AcctPathMapping>> {
 		Box::new(
 			self.db
 				.borrow()
@@ -448,7 +538,19 @@ where
 
 	fn save_private_context(&mut self, slate_id: &[u8], ctx: &Context) -> Result<(), Error> {
 		let ctx_key = to_key(PRIVATE_TX_CONTEXT_PREFIX, &mut slate_id.to_vec());
-		self.db.borrow().as_ref().unwrap().put_ser(&ctx_key, &ctx)?;
+		let (blind_xor_key, nonce_xor_key) = private_ctx_xor_keys(self.keychain(), slate_id)?;
+
+		let mut s_ctx = ctx.clone();
+		for i in 0..SECRET_KEY_SIZE {
+			s_ctx.sec_key.0[i] = s_ctx.sec_key.0[i] ^ blind_xor_key[i];
+			s_ctx.sec_nonce.0[i] = s_ctx.sec_nonce.0[i] ^ nonce_xor_key[i];
+		}
+
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&ctx_key, &s_ctx)?;
 		Ok(())
 	}
 
